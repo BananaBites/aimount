@@ -61,7 +61,17 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
 RUN set -eux; \
     if getent group "${GID}" >/dev/null; then group_name="$(getent group "${GID}" | cut -d: -f1)"; \
     else groupadd --gid "${GID}" "${USERNAME}" && group_name="${USERNAME}"; fi; \
-    useradd --uid "${UID}" --gid "${GID}" -m -s /bin/bash "${USERNAME}"; \
+    if getent passwd "${UID}" >/dev/null; then \
+      old_user="$(getent passwd "${UID}" | cut -d: -f1)"; \
+      if [ "${old_user}" != "${USERNAME}" ]; then usermod -l "${USERNAME}" "${old_user}"; fi; \
+      usermod -d "/home/${USERNAME}" -m "${USERNAME}" || true; \
+      usermod -s /bin/bash "${USERNAME}"; \
+    else \
+      useradd --uid "${UID}" --gid "${GID}" -m -s /bin/bash "${USERNAME}"; \
+    fi; \
+    usermod -g "${GID}" "${USERNAME}"; \
+    mkdir -p "/home/${USERNAME}"; \
+    chown -R "${UID}:${GID}" "/home/${USERNAME}"; \
     echo "${USERNAME} ALL=(ALL) NOPASSWD:ALL" > "/etc/sudoers.d/${USERNAME}"; \
     chmod 0440 "/etc/sudoers.d/${USERNAME}"
 
@@ -98,6 +108,32 @@ ssh = []
 auth = []
 dirs = []
 """
+
+LEGACY_UID_BLOCK = '''RUN set -eux; \\
+    if getent group "${GID}" >/dev/null; then group_name="$(getent group "${GID}" | cut -d: -f1)"; \\
+    else groupadd --gid "${GID}" "${USERNAME}" && group_name="${USERNAME}"; fi; \\
+    useradd --uid "${UID}" --gid "${GID}" -m -s /bin/bash "${USERNAME}"; \\
+    echo "${USERNAME} ALL=(ALL) NOPASSWD:ALL" > "/etc/sudoers.d/${USERNAME}"; \\
+    chmod 0440 "/etc/sudoers.d/${USERNAME}"
+'''
+
+FIXED_UID_BLOCK = '''RUN set -eux; \\
+    if getent group "${GID}" >/dev/null; then group_name="$(getent group "${GID}" | cut -d: -f1)"; \\
+    else groupadd --gid "${GID}" "${USERNAME}" && group_name="${USERNAME}"; fi; \\
+    if getent passwd "${UID}" >/dev/null; then \\
+      old_user="$(getent passwd "${UID}" | cut -d: -f1)"; \\
+      if [ "${old_user}" != "${USERNAME}" ]; then usermod -l "${USERNAME}" "${old_user}"; fi; \\
+      usermod -d "/home/${USERNAME}" -m "${USERNAME}" || true; \\
+      usermod -s /bin/bash "${USERNAME}"; \\
+    else \\
+      useradd --uid "${UID}" --gid "${GID}" -m -s /bin/bash "${USERNAME}"; \\
+    fi; \\
+    usermod -g "${GID}" "${USERNAME}"; \\
+    mkdir -p "/home/${USERNAME}"; \\
+    chown -R "${UID}:${GID}" "/home/${USERNAME}"; \\
+    echo "${USERNAME} ALL=(ALL) NOPASSWD:ALL" > "/etc/sudoers.d/${USERNAME}"; \\
+    chmod 0440 "/etc/sudoers.d/${USERNAME}"
+'''
 
 
 def project_root() -> Path:
@@ -137,6 +173,11 @@ def ensure_project(root: Path) -> None:
     if not df.exists():
         df.write_text(DOCKERFILE)
         console.print(f"[green]created[/] {df}")
+    else:
+        text = df.read_text()
+        if LEGACY_UID_BLOCK in text:
+            df.write_text(text.replace(LEGACY_UID_BLOCK, FIXED_UID_BLOCK))
+            console.print(f"[green]updated[/] {df} UID handling")
     if not cfg.exists():
         cfg.write_text(PROJECT_CONFIG)
         console.print(f"[green]created[/] {cfg}")
