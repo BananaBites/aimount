@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "aimount"
+version = "0.1.0"
+description = "Minimal local-first Docker workspaces for autonomous coding agents"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "typer>=0.12",
+  "rich>=13",
+]
+
+[project.scripts]
+aim = "aim.cli:app"
+
+[tool.setuptools.packages.find]
+include = ["aim*"]

@@ -1,0 +1,669 @@
+from __future__ import annotations
+
+import getpass
+import hashlib
+import json
+import os
+import platform
+import re
+import shutil
+import subprocess
+import sys
+import tomllib
+from pathlib import Path
+from typing import Any
+
+import typer
+from rich.console import Console
+
+app = typer.Typer(
+    invoke_without_command=True,
+    no_args_is_help=False,
+    help="Launch a small Docker workspace for autonomous coding agents.",
+)
+allow_app = typer.Typer(help="Allow selected host resources into the workspace.")
+network_app = typer.Typer(help="Configure workspace networking.")
+app.add_typer(allow_app, name="allow")
+app.add_typer(network_app, name="network")
+console = Console()
+
+GLOBAL_DIR = Path.home() / ".aim"
+PROJECT_DIRNAME = ".aim"
+DEFAULT_PORTS = [3000, 5173, 8000, 8080]
+DEFAULT_IGNORES = [".aim", ".env", ".env.local"]
+AUTH_TARGETS = {
+    "codex": ".codex",
+    "pi": ".pi",
+}
+
+DOCKERFILE = r"""FROM ubuntu:24.04
+
+ARG USERNAME=aim
+ARG UID=1000
+ARG GID=1000
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    RUSTUP_HOME=/opt/rustup \
+    CARGO_HOME=/opt/cargo \
+    PATH=/opt/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates sudo git curl wget ripgrep fd-find jq tree vim nano tmux htop \
+    build-essential cmake python3 python3-pip python3-venv nodejs npm sqlite3 \
+    unzip zip rsync openssh-client bash-completion less locales pkg-config \
+  && rm -rf /var/lib/apt/lists/* \
+  && ln -sf /usr/bin/fdfind /usr/local/bin/fd
+
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+  | CARGO_HOME=/opt/cargo RUSTUP_HOME=/opt/rustup sh -s -- -y --profile minimal --no-modify-path \
+  && chmod -R a+rwX /opt/cargo /opt/rustup
+
+RUN set -eux; \
+    if getent group "${GID}" >/dev/null; then group_name="$(getent group "${GID}" | cut -d: -f1)"; \
+    else groupadd --gid "${GID}" "${USERNAME}" && group_name="${USERNAME}"; fi; \
+    useradd --uid "${UID}" --gid "${GID}" -m -s /bin/bash "${USERNAME}"; \
+    echo "${USERNAME} ALL=(ALL) NOPASSWD:ALL" > "/etc/sudoers.d/${USERNAME}"; \
+    chmod 0440 "/etc/sudoers.d/${USERNAME}"
+
+RUN printf '%s\n' \
+  'export PATH="/opt/cargo/bin:$PATH"' \
+  'if [ -n "$PS1" ]; then' \
+  '  export PS1="\[\e[1;36m\]aim\[\e[0m\] \[\e[1;32m\]\u@\h\[\e[0m\]:\[\e[1;34m\]\w\[\e[0m\]\\$ "' \
+  'fi' > /etc/profile.d/aim.sh
+
+USER ${USERNAME}
+WORKDIR /home/${USERNAME}
+CMD ["bash"]
+"""
+
+PROJECT_CONFIG = """# Project-local aim config. Safe to commit/share.
+
+[network]
+mode = "auto"   # auto, host, bridge, off
+ports = [3000, 5173, 8000, 8080]
+
+[ignore]
+paths = [".aim", ".env", ".env.local"]
+
+[container]
+# username = "dev"
+# uid = 1000
+# gid = 1000
+"""
+
+GLOBAL_CONFIG = """# User-local aim config. Personal resources only; do not commit.
+
+[allow]
+ssh = []
+auth = []
+dirs = []
+"""
+
+
+def project_root() -> Path:
+    return Path.cwd().resolve()
+
+
+def project_aim_dir(root: Path) -> Path:
+    return root / PROJECT_DIRNAME
+
+
+def project_config_path(root: Path) -> Path:
+    return project_aim_dir(root) / "config.toml"
+
+
+def dockerfile_path(root: Path) -> Path:
+    return project_aim_dir(root) / "Dockerfile"
+
+
+def global_config_path() -> Path:
+    return GLOBAL_DIR / "config.toml"
+
+
+def ensure_global() -> None:
+    GLOBAL_DIR.mkdir(parents=True, exist_ok=True)
+    for sub in ("ssh", "auth", "empty"):
+        (GLOBAL_DIR / sub).mkdir(exist_ok=True)
+    cfg = global_config_path()
+    if not cfg.exists():
+        cfg.write_text(GLOBAL_CONFIG)
+
+
+def ensure_project(root: Path) -> None:
+    pdir = project_aim_dir(root)
+    pdir.mkdir(exist_ok=True)
+    df = dockerfile_path(root)
+    cfg = project_config_path(root)
+    if not df.exists():
+        df.write_text(DOCKERFILE)
+        console.print(f"[green]created[/] {df}")
+    if not cfg.exists():
+        cfg.write_text(PROJECT_CONFIG)
+        console.print(f"[green]created[/] {cfg}")
+
+
+def load_toml(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {}
+    with path.open("rb") as f:
+        return tomllib.load(f)
+
+
+def toml_value(value: Any) -> str:
+    if isinstance(value, str):
+        return json.dumps(value)
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, int | float):
+        return str(value)
+    if isinstance(value, list):
+        return "[" + ", ".join(toml_value(v) for v in value) + "]"
+    if isinstance(value, dict):
+        return "{ " + ", ".join(f"{k} = {toml_value(v)}" for k, v in value.items()) + " }"
+    raise TypeError(f"cannot write TOML value: {value!r}")
+
+
+def write_toml(path: Path, data: dict[str, Any], header: str = "") -> None:
+    lines: list[str] = []
+    if header:
+        lines.append(header.rstrip())
+        lines.append("")
+    for key, value in data.items():
+        if isinstance(value, dict):
+            lines.append(f"[{key}]")
+            for k, v in value.items():
+                lines.append(f"{k} = {toml_value(v)}")
+            lines.append("")
+        else:
+            lines.append(f"{key} = {toml_value(value)}")
+    path.write_text("\n".join(lines).rstrip() + "\n")
+
+
+def save_project(root: Path, data: dict[str, Any]) -> None:
+    write_toml(project_config_path(root), data, "# Project-local aim config. Safe to commit/share.")
+
+
+def save_global(data: dict[str, Any]) -> None:
+    ensure_global()
+    write_toml(global_config_path(), data, "# User-local aim config. Personal resources only; do not commit.")
+
+
+def run(args: list[str], *, capture: bool = False, check: bool = True) -> subprocess.CompletedProcess[str]:
+    kwargs: dict[str, Any] = {"text": True}
+    if capture:
+        kwargs.update(stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    proc = subprocess.run(args, **kwargs)
+    if check and proc.returncode != 0:
+        if capture and proc.stderr:
+            console.print(proc.stderr.rstrip(), style="red")
+        raise typer.Exit(proc.returncode)
+    return proc
+
+
+def docker(args: list[str], *, capture: bool = False, check: bool = True) -> subprocess.CompletedProcess[str]:
+    try:
+        return run(["docker", *args], capture=capture, check=check)
+    except FileNotFoundError:
+        console.print("[red]docker binary not found[/]")
+        raise typer.Exit(1)
+
+
+def docker_ok() -> bool:
+    try:
+        return run(["docker", "info"], capture=True, check=False).returncode == 0
+    except FileNotFoundError:
+        return False
+
+
+def slug(root: Path) -> str:
+    base = re.sub(r"[^a-zA-Z0-9_.-]+", "-", root.name).strip("-._").lower() or "project"
+    h = hashlib.sha1(str(root).encode()).hexdigest()[:10]
+    return f"{base}-{h}"
+
+
+def image_name(root: Path) -> str:
+    return f"aim-{slug(root)}:latest"
+
+
+def container_name(root: Path) -> str:
+    user = re.sub(r"[^a-zA-Z0-9_.-]+", "-", getpass.getuser()).lower() or "user"
+    return f"aim-{user}-{slug(root)}"
+
+
+def image_exists(image: str) -> bool:
+    return docker(["image", "inspect", image], capture=True, check=False).returncode == 0
+
+
+def container_exists(name: str) -> bool:
+    return docker(["container", "inspect", name], capture=True, check=False).returncode == 0
+
+
+def container_running(name: str) -> bool:
+    out = docker(["inspect", "-f", "{{.State.Running}}", name], capture=True, check=False)
+    return out.returncode == 0 and out.stdout.strip() == "true"
+
+
+def container_label(name: str, label: str) -> str:
+    out = docker(["inspect", "-f", "{{ index .Config.Labels " + json.dumps(label) + " }}", name], capture=True, check=False)
+    return out.stdout.strip() if out.returncode == 0 else ""
+
+
+def host_ids() -> tuple[int, int]:
+    return (os.getuid() if hasattr(os, "getuid") else 1000, os.getgid() if hasattr(os, "getgid") else 1000)
+
+
+def user_spec(config: dict[str, Any]) -> tuple[str, int, int]:
+    container = config.get("container", {})
+    uid, gid = host_ids()
+    username = container.get("username") or getpass.getuser() or "aim"
+    username = re.sub(r"[^a-zA-Z0-9_-]+", "-", str(username)).strip("-") or "aim"
+    return username, int(container.get("uid", uid)), int(container.get("gid", gid))
+
+
+def build_image(root: Path, *, force: bool = False) -> None:
+    ensure_project(root)
+    cfg = load_toml(project_config_path(root))
+    username, uid, gid = user_spec(cfg)
+    image = image_name(root)
+    if not force and image_exists(image):
+        return
+    console.print(f"[cyan]building[/] {image}")
+    args = [
+        "build",
+        "-t",
+        image,
+        "-f",
+        str(dockerfile_path(root)),
+        "--build-arg",
+        f"USERNAME={username}",
+        "--build-arg",
+        f"UID={uid}",
+        "--build-arg",
+        f"GID={gid}",
+        str(project_aim_dir(root)),
+    ]
+    docker(args)
+
+
+def network_args(config: dict[str, Any]) -> list[str]:
+    net = config.get("network", {})
+    mode = str(net.get("mode", "auto"))
+    if mode == "off":
+        return ["--network", "none"]
+    if mode == "host" or (mode == "auto" and platform.system() == "Linux"):
+        return ["--network", "host"]
+    ports = net.get("ports", DEFAULT_PORTS)
+    args: list[str] = []
+    for port in ports:
+        p = int(port)
+        args += ["-p", f"127.0.0.1:{p}:{p}"]
+    return args
+
+
+def mount_arg(source: Path | str, target: str, *, readonly: bool = False, kind: str = "bind") -> list[str]:
+    if kind == "tmpfs":
+        return ["--mount", f"type=tmpfs,target={target},tmpfs-size=1048576"]
+    spec = f"type=bind,source={source},target={target}"
+    if readonly:
+        spec += ",readonly"
+    return ["--mount", spec]
+
+
+def ignore_paths(root: Path, config: dict[str, Any]) -> list[str]:
+    paths = list(config.get("ignore", {}).get("paths", DEFAULT_IGNORES))
+    aimignore = root / ".aimignore"
+    if aimignore.exists():
+        for line in aimignore.read_text().splitlines():
+            line = line.strip()
+            if line and not line.startswith("#"):
+                paths.append(line)
+    seen: set[str] = set()
+    clean: list[str] = []
+    for p in paths:
+        p = str(p).strip().strip("/")
+        if not p or p in seen or Path(p).is_absolute() or ".." in Path(p).parts:
+            continue
+        if any(ch in p for ch in "*?["):
+            continue
+        seen.add(p)
+        clean.append(p)
+    return clean
+
+
+def all_mounts(root: Path, config: dict[str, Any], global_config: dict[str, Any], username: str) -> list[str]:
+    args: list[str] = []
+    args += mount_arg(root, str(root))
+
+    for p in ignore_paths(root, config):
+        host_path = root / p
+        target = str(root / p)
+        if host_path.is_dir():
+            args += mount_arg("", target, kind="tmpfs")
+        elif host_path.is_file():
+            args += mount_arg("/dev/null", target, readonly=True)
+
+    allow = global_config.get("allow", {})
+    home = f"/home/{username}"
+
+    ssh_names = list(allow.get("ssh", []))
+    if len(ssh_names) > 1:
+        console.print("[yellow]multiple SSH profiles configured; mounting the first one only[/]")
+    if ssh_names:
+        src = GLOBAL_DIR / "ssh" / str(ssh_names[0])
+        src.mkdir(parents=True, exist_ok=True)
+        args += mount_arg(src, f"{home}/.ssh", readonly=True)
+
+    for auth in allow.get("auth", []):
+        name = str(auth)
+        src = GLOBAL_DIR / "auth" / name
+        src.mkdir(parents=True, exist_ok=True)
+        target = AUTH_TARGETS.get(name, f".{name}")
+        args += mount_arg(src, f"{home}/{target}")
+
+    for item in allow.get("dirs", []):
+        if not isinstance(item, dict) or "path" not in item:
+            continue
+        src = Path(str(item["path"])).expanduser().resolve()
+        if not src.exists():
+            console.print(f"[yellow]skipping missing allowed dir[/] {src}")
+            continue
+        args += mount_arg(src, str(src), readonly=bool(item.get("readonly", False)))
+    return args
+
+
+def desired_hash(root: Path, config: dict[str, Any], global_config: dict[str, Any], username: str) -> str:
+    payload = {
+        "root": str(root),
+        "image": image_name(root),
+        "user": username,
+        "network": network_args(config),
+        "mounts": all_mounts(root, config, global_config, username),
+    }
+    return hashlib.sha1(json.dumps(payload, sort_keys=True).encode()).hexdigest()
+
+
+def remove_container(name: str) -> None:
+    if container_exists(name):
+        docker(["rm", "-f", name], check=False)
+
+
+def ensure_container(root: Path) -> None:
+    ensure_global()
+    ensure_project(root)
+    build_image(root)
+    cfg = load_toml(project_config_path(root))
+    global_cfg = load_toml(global_config_path())
+    username, _uid, _gid = user_spec(cfg)
+    name = container_name(root)
+    desired = desired_hash(root, cfg, global_cfg, username)
+
+    if container_exists(name):
+        current = container_label(name, "aim.config")
+        if current != desired:
+            console.print("[yellow]workspace config changed; recreating container[/]")
+            remove_container(name)
+        elif not container_running(name):
+            docker(["start", name])
+            return
+        else:
+            return
+
+    home = f"/home/{username}"
+    args = [
+        "run",
+        "-d",
+        "--name",
+        name,
+        "--hostname",
+        "aim",
+        "--label",
+        "aim.managed=1",
+        "--label",
+        f"aim.project={root}",
+        "--label",
+        f"aim.config={desired}",
+        "--user",
+        username,
+        "-e",
+        f"HOME={home}",
+        "-e",
+        "TERM=xterm-256color",
+        "-w",
+        str(root),
+        *network_args(cfg),
+        *all_mounts(root, cfg, global_cfg, username),
+        image_name(root),
+        "sleep",
+        "infinity",
+    ]
+    console.print(f"[cyan]starting[/] {name}")
+    docker(args)
+
+
+def enter_shell(root: Path) -> None:
+    cfg = load_toml(project_config_path(root))
+    username, _uid, _gid = user_spec(cfg)
+    args = ["docker", "exec"]
+    args.append("-it" if sys.stdin.isatty() and sys.stdout.isatty() else "-i")
+    args += [
+        "--user",
+        username,
+        "-e",
+        f"HOME=/home/{username}",
+        "-e",
+        "TERM=xterm-256color",
+        "-w",
+        str(root),
+        container_name(root),
+        "bash",
+        "-l",
+    ]
+    raise typer.Exit(subprocess.call(args))
+
+
+def launch() -> None:
+    if not docker_ok():
+        console.print("[red]Docker is not available or the daemon is not running.[/]")
+        raise typer.Exit(1)
+    root = project_root()
+    ensure_container(root)
+    enter_shell(root)
+
+
+@app.callback()
+def main(ctx: typer.Context) -> None:
+    if ctx.invoked_subcommand is None:
+        launch()
+
+
+@app.command()
+def init() -> None:
+    """Create .aim/Dockerfile and .aim/config.toml if missing."""
+    ensure_global()
+    ensure_project(project_root())
+    console.print("[green]aim initialized[/]")
+
+
+@app.command()
+def rebuild(no_cache: bool = typer.Option(False, "--no-cache", help="Disable Docker build cache.")) -> None:
+    """Rebuild the project image and recreate the workspace container."""
+    root = project_root()
+    ensure_global()
+    ensure_project(root)
+    image = image_name(root)
+    username, uid, gid = user_spec(load_toml(project_config_path(root)))
+    args = ["build", "-t", image]
+    if no_cache:
+        args.append("--no-cache")
+    args += [
+        "-f",
+        str(dockerfile_path(root)),
+        "--build-arg",
+        f"USERNAME={username}",
+        "--build-arg",
+        f"UID={uid}",
+        "--build-arg",
+        f"GID={gid}",
+        str(project_aim_dir(root)),
+    ]
+    docker(args)
+    remove_container(container_name(root))
+    console.print("[green]rebuilt; next `aim` will start a fresh container[/]")
+
+
+@app.command()
+def reset() -> None:
+    """Destroy and recreate the workspace, then enter it."""
+    root = project_root()
+    remove_container(container_name(root))
+    ensure_container(root)
+    enter_shell(root)
+
+
+@app.command()
+def clean(image: bool = typer.Option(False, "--image", help="Also remove the Docker image.")) -> None:
+    """Remove the current project's workspace container."""
+    root = project_root()
+    remove_container(container_name(root))
+    if image:
+        docker(["rmi", image_name(root)], check=False)
+    console.print("[green]cleaned[/]")
+
+
+@app.command(name="list")
+def list_workspaces() -> None:
+    """List aim-managed containers."""
+    docker(["ps", "-a", "--filter", "label=aim.managed=1", "--format", "table {{.Names}}\t{{.Status}}\t{{.Image}}"])
+
+
+@app.command()
+def doctor() -> None:
+    """Check Docker and local aim configuration."""
+    ok = True
+    docker_bin = shutil.which("docker")
+    if docker_bin:
+        console.print(f"[green]docker binary[/] {docker_bin}")
+    else:
+        console.print("[red]docker binary not found[/]")
+        ok = False
+    if docker_ok():
+        console.print("[green]docker daemon[/] running")
+    else:
+        console.print("[red]docker daemon not reachable[/]")
+        ok = False
+    root = project_root()
+    console.print(f"project: {root}")
+    console.print(f"config:  {project_config_path(root)}")
+    raise typer.Exit(0 if ok else 1)
+
+
+@allow_app.command("ssh")
+def allow_ssh(name: str) -> None:
+    """Allow ~/.aim/ssh/NAME as ~/.ssh inside the container."""
+    ensure_global()
+    cfg = load_toml(global_config_path())
+    allow = cfg.setdefault("allow", {})
+    items = list(allow.get("ssh", []))
+    if name not in items:
+        items.append(name)
+    allow["ssh"] = items
+    path = GLOBAL_DIR / "ssh" / name
+    path.mkdir(parents=True, exist_ok=True)
+    save_global(cfg)
+    console.print(f"[green]allowed ssh[/] {name} -> {path}")
+
+
+@allow_app.command("auth")
+def allow_auth(name: str) -> None:
+    """Allow ~/.aim/auth/NAME as the matching tool auth directory."""
+    ensure_global()
+    cfg = load_toml(global_config_path())
+    allow = cfg.setdefault("allow", {})
+    items = list(allow.get("auth", []))
+    if name not in items:
+        items.append(name)
+    allow["auth"] = items
+    path = GLOBAL_DIR / "auth" / name
+    path.mkdir(parents=True, exist_ok=True)
+    save_global(cfg)
+    console.print(f"[green]allowed auth[/] {name} -> {path}")
+
+
+@allow_app.command("dir")
+def allow_dir(path: str, ro: bool = typer.Option(False, "--ro/--rw", help="Mount read-only/read-write.")) -> None:
+    """Allow a host directory at the same absolute path inside the container."""
+    ensure_global()
+    src = Path(path).expanduser().resolve()
+    if not src.exists() or not src.is_dir():
+        console.print(f"[red]not a directory:[/] {src}")
+        raise typer.Exit(1)
+    cfg = load_toml(global_config_path())
+    allow = cfg.setdefault("allow", {})
+    dirs = [d for d in allow.get("dirs", []) if not (isinstance(d, dict) and d.get("path") == str(src))]
+    dirs.append({"path": str(src), "readonly": bool(ro)})
+    allow["dirs"] = dirs
+    save_global(cfg)
+    console.print(f"[green]allowed dir[/] {src} ({'ro' if ro else 'rw'})")
+
+
+@allow_app.command("port")
+def allow_port(port: int) -> None:
+    """Expose a development port when not using host networking."""
+    root = project_root()
+    ensure_project(root)
+    cfg = load_toml(project_config_path(root))
+    net = cfg.setdefault("network", {})
+    ports = [int(p) for p in net.get("ports", DEFAULT_PORTS)]
+    if port not in ports:
+        ports.append(port)
+    net["ports"] = sorted(ports)
+    save_project(root, cfg)
+    console.print(f"[green]allowed port[/] {port}")
+
+
+@network_app.command("off")
+def network_off() -> None:
+    """Disable container networking."""
+    root = project_root()
+    ensure_project(root)
+    cfg = load_toml(project_config_path(root))
+    cfg.setdefault("network", {})["mode"] = "off"
+    save_project(root, cfg)
+    console.print("[green]network[/] off")
+
+
+@network_app.command("host")
+def network_host() -> None:
+    """Use Docker host networking."""
+    root = project_root()
+    ensure_project(root)
+    cfg = load_toml(project_config_path(root))
+    cfg.setdefault("network", {})["mode"] = "host"
+    save_project(root, cfg)
+    console.print("[green]network[/] host")
+
+
+@network_app.command("bridge")
+def network_bridge() -> None:
+    """Use Docker bridge networking with configured port forwards."""
+    root = project_root()
+    ensure_project(root)
+    cfg = load_toml(project_config_path(root))
+    cfg.setdefault("network", {})["mode"] = "bridge"
+    save_project(root, cfg)
+    console.print("[green]network[/] bridge")
+
+
+@network_app.command("auto")
+def network_auto() -> None:
+    """Use host networking on Linux, otherwise expose configured ports."""
+    root = project_root()
+    ensure_project(root)
+    cfg = load_toml(project_config_path(root))
+    cfg.setdefault("network", {})["mode"] = "auto"
+    save_project(root, cfg)
+    console.print("[green]network[/] auto")
+
+
+if __name__ == "__main__":
+    app()
