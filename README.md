@@ -1,5 +1,7 @@
 # AiMount
 
+[![tests](https://github.com/BananaBites/aimount/actions/workflows/tests.yml/badge.svg)](https://github.com/BananaBites/aimount/actions/workflows/tests.yml)
+
 AiMount (`aim`) is a minimal local-first CLI that starts a persistent Docker workspace
 for autonomous coding agents
 while only sharing host resources you explicitly choose.
@@ -9,10 +11,26 @@ It is a developer convenience/containment tool, not a hardened sandbox.
 
 ## Install
 
+From a local checkout:
+
 ```bash
 pip install .
 # or
 pipx install .
+```
+
+Directly from GitHub:
+
+```bash
+pip install git+https://github.com/BananaBites/aimount.git
+# or
+pipx install git+https://github.com/BananaBites/aimount.git
+```
+
+Pinned to a tag/branch:
+
+```bash
+pip install git+https://github.com/BananaBites/aimount.git@v0.4.0
 ```
 
 
