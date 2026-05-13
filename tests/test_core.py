@@ -107,6 +107,44 @@ def test_mounts_include_project_masks_and_project_shares(workspace: tuple[Path, 
     assert f"type=bind,source={gitconfig},target=/home/hannes/.gitconfig,readonly" in specs
 
 
+def test_build_image_skips_when_build_hash_matches(
+    workspace: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _home, project = workspace
+    cli.ensure_project(project)
+    config = cli.load_toml(project / ".aim" / "config.toml")
+    username, uid, gid = cli.user_spec(config)
+    desired = cli.build_hash(project, username, uid, gid)
+    calls: list[list[str]] = []
+
+    monkeypatch.setattr(cli, "image_exists", lambda image: True)
+    monkeypatch.setattr(cli, "image_label", lambda image, label: desired)
+    monkeypatch.setattr(cli, "docker", lambda args, **kwargs: calls.append(args))
+
+    cli.build_image(project)
+
+    assert calls == []
+
+
+def test_build_image_rebuilds_when_build_hash_differs(
+    workspace: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _home, project = workspace
+    calls: list[list[str]] = []
+
+    monkeypatch.setattr(cli, "image_exists", lambda image: True)
+    monkeypatch.setattr(cli, "image_label", lambda image, label: "old")
+    monkeypatch.setattr(cli, "docker", lambda args, **kwargs: calls.append(args))
+
+    cli.build_image(project)
+
+    build_args = calls[0]
+    assert build_args[:2] == ["build", "-t"]
+    assert "--label" in build_args
+    assert "aim.managed=1" in build_args
+    assert any(arg.startswith("aim.build=") for arg in build_args)
+
+
 def test_network_modes(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(cli.platform, "system", lambda: "Linux")
 

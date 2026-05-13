@@ -1,8 +1,11 @@
-# aimount
+# AiMount
 
-`aim` is a minimal local-first CLI that starts a persistent Docker workspace for autonomous coding agents while only sharing host resources you explicitly choose.
+AiMount (`aim`) is a minimal local-first CLI that starts a persistent Docker workspace
+for autonomous coding agents
+while only sharing host resources you explicitly choose.
 
 It is a developer convenience/containment tool, not a hardened sandbox.
+
 
 ## Install
 
@@ -12,6 +15,7 @@ pip install .
 pipx install .
 ```
 
+
 ## Use
 
 From a project directory:
@@ -20,7 +24,9 @@ From a project directory:
 aim
 ```
 
-On first run this creates `.aim/Dockerfile` and `.aim/config.toml`, builds an Ubuntu-based image, starts/reuses a named container, mounts the current project at the same absolute path, and drops you into `bash`.
+On first run this creates `.aim/Dockerfile` and `.aim/config.toml`,
+builds an Ubuntu-based image, starts/reuses a named container,
+mounts the current project at the same absolute path, and drops you into `bash`.
 
 The default Dockerfile installs common agent CLIs globally:
 
@@ -29,6 +35,32 @@ The default Dockerfile installs common agent CLIs globally:
 - `claude` (`@anthropic-ai/claude-code`)
 - `gemini` (`@google/gemini-cli`)
 
+
+## Shell completion
+
+Try completion only for the current shell session:
+
+```bash
+# bash/zsh
+eval "$(aim --show-completion)"
+
+# fish
+aim --show-completion | source
+```
+
+Persistent installation is available via:
+
+```bash
+aim --install-completion
+```
+
+Typer does not provide an uninstall command. To find installed completion snippets/files:
+
+```bash
+grep -R "aim" ~/.bashrc ~/.zshrc ~/.bash_completion ~/.local/share/bash-completion ~/.config/fish/completions 2>/dev/null
+```
+
+
 ## Commands
 
 ```bash
@@ -36,9 +68,12 @@ aim
 aim init
 aim init --force          # overwrite .aim/Dockerfile with current default
 aim run pi                # run a command inside the workspace
+aim run -- pi --help      # use -- before command flags
 aim rebuild
 aim reset
 aim clean
+aim clean --all           # remove all aim containers/images; prompts first
+aim clean --all --force   # same, without prompt
 
 aim share agent pi        # ~/.aim/share/agents/pi -> ~/.pi
 aim share agent codex     # ~/.aim/share/agents/codex -> ~/.codex
@@ -66,10 +101,29 @@ aim list
 aim doctor                # checks Docker, shares, and outside-project symlinks
 ```
 
+
+## Recommended Pi workflow
+
+```bash
+aim init
+aim share agent pi --host
+aim run pi
+```
+
+This exposes only the current project and your real `~/.pi` directory to Pi.
+If the command you run has its own flags, put `--` before it:
+
+```bash
+aim run -- pi --help
+```
+
+
 ## Sharing model
 
 - Shares are project-local and written to `.aim/config.toml`.
 - `share agent NAME` shares persistent state/config for an AI CLI.
+- `aim share agent pi` mounts `~/.aim/share/agents/pi` as `~/.pi` in the container.
+- `aim share agent pi --host` mounts your real host `~/.pi` as `~/.pi` in the container.
 - `share ssh` shares SSH identity/config as `~/.ssh`.
 - `share dir` and `share file` share real host paths.
 - `--host` means use the real host location instead of aim-managed storage.

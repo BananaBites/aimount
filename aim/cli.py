@@ -113,6 +113,8 @@ ports = [3000, 5173, 8000, 8080]
 [ignore]
 paths = [".aim", ".env", ".env.local"]
 
+# Optional: override the container user.
+# By default aim mirrors your host username and UID/GID so files stay editable.
 [container]
 # username = "dev"
 # uid = 1000
@@ -294,6 +296,12 @@ def image_exists(image: str) -> bool:
     return docker(["image", "inspect", image], capture=True, check=False).returncode == 0
 
 
+def image_label(image: str, label: str) -> str:
+    tmpl = "{{ index .Config.Labels " + json.dumps(label) + " }}"
+    out = docker(["image", "inspect", "-f", tmpl, image], capture=True, check=False)
+    return out.stdout.strip() if out.returncode == 0 else ""
+
+
 def container_exists(name: str) -> bool:
     return docker(["container", "inspect", name], capture=True, check=False).returncode == 0
 
@@ -321,17 +329,30 @@ def user_spec(config: dict[str, Any]) -> tuple[str, int, int]:
     return username, int(container.get("uid", uid)), int(container.get("gid", gid))
 
 
+def build_hash(root: Path, username: str, uid: int, gid: int) -> str:
+    payload = {
+        "dockerfile": dockerfile_path(root).read_text(),
+        "username": username,
+        "uid": uid,
+        "gid": gid,
+    }
+    return hashlib.sha1(json.dumps(payload, sort_keys=True).encode()).hexdigest()
+
+
 def build_image(root: Path, *, force: bool = False) -> None:
     ensure_project(root)
     cfg = load_toml(project_config_path(root))
     username, uid, gid = user_spec(cfg)
     image = image_name(root)
-    if not force and image_exists(image):
+    desired = build_hash(root, username, uid, gid)
+    if not force and image_exists(image) and image_label(image, "aim.build") == desired:
         return
     console.print(f"[cyan]building[/] {image}")
     docker([
         "build",
         "-t", image,
+        "--label", f"aim.managed=1",
+        "--label", f"aim.build={desired}",
         "-f", str(dockerfile_path(root)),
         "--build-arg", f"USERNAME={username}",
         "--build-arg", f"UID={uid}",
@@ -472,6 +493,17 @@ def remove_container(name: str) -> None:
         docker(["rm", "-f", name], check=False)
 
 
+def remove_all_docker_artifacts() -> None:
+    containers = docker(["ps", "-aq", "--filter", "label=aim.managed=1"], capture=True, check=False).stdout.split()
+    if containers:
+        docker(["rm", "-f", *containers], check=False)
+
+    out = docker(["images", "--format", "{{.Repository}}:{{.Tag}}"], capture=True, check=False)
+    images = [line for line in out.stdout.splitlines() if line.startswith("aim-")]
+    if images:
+        docker(["rmi", *images], check=False)
+
+
 def ensure_container(root: Path) -> None:
     ensure_global()
     ensure_project(root)
@@ -579,7 +611,8 @@ def rebuild(no_cache: bool = typer.Option(False, "--no-cache", help="Disable Doc
     ensure_project(root)
     image = image_name(root)
     username, uid, gid = user_spec(load_toml(project_config_path(root)))
-    args = ["build", "-t", image]
+    desired = build_hash(root, username, uid, gid)
+    args = ["build", "-t", image, "--label", "aim.managed=1", "--label", f"aim.build={desired}"]
     if no_cache:
         args.append("--no-cache")
     args += [
@@ -604,8 +637,19 @@ def reset() -> None:
 
 
 @app.command()
-def clean(image: bool = typer.Option(False, "--image", help="Also remove the Docker image.")) -> None:
-    """Remove the current project's workspace container."""
+def clean(
+    image: bool = typer.Option(False, "--image", help="Also remove the current project's Docker image."),
+    all_: bool = typer.Option(False, "--all", help="Remove all aim-managed Docker containers and aim images."),
+    force: bool = typer.Option(False, "--force", "-f", help="Do not prompt when using --all."),
+) -> None:
+    """Remove workspace Docker artifacts."""
+    if all_:
+        if not force and not typer.confirm("Remove all aim containers and aim images?"):
+            raise typer.Exit(1)
+        remove_all_docker_artifacts()
+        console.print("[green]cleaned all aim Docker artifacts[/]")
+        return
+
     root = project_root()
     remove_container(container_name(root))
     if image:
