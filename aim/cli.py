@@ -21,9 +21,13 @@ app = typer.Typer(
     no_args_is_help=False,
     help="Launch a small Docker workspace for autonomous coding agents.",
 )
-allow_app = typer.Typer(help="Allow selected host resources into the workspace.")
+share_app = typer.Typer(help="Share persistent host resources with the workspace.")
+unshare_app = typer.Typer(help="Stop sharing persistent host resources with the workspace.")
+expose_app = typer.Typer(help="Expose development ports.")
 network_app = typer.Typer(help="Configure workspace networking.")
-app.add_typer(allow_app, name="allow")
+app.add_typer(share_app, name="share")
+app.add_typer(unshare_app, name="unshare")
+app.add_typer(expose_app, name="expose")
 app.add_typer(network_app, name="network")
 console = Console()
 
@@ -31,12 +35,15 @@ GLOBAL_DIR = Path.home() / ".aim"
 PROJECT_DIRNAME = ".aim"
 DEFAULT_PORTS = [3000, 5173, 8000, 8080]
 DEFAULT_IGNORES = [".aim", ".env", ".env.local"]
-AUTH_TARGETS = {
-    "codex": ".codex",
+AGENT_DIRS = {
     "pi": ".pi",
+    "codex": ".codex",
+    "claude": ".claude",
+    "gemini": ".gemini",
 }
 
-DOCKERFILE = r"""FROM ubuntu:24.04
+DOCKERFILE = r"""# aim default Dockerfile v2
+FROM ubuntu:24.04
 
 ARG USERNAME=aim
 ARG UID=1000
@@ -48,11 +55,22 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PATH=/opt/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates sudo git curl wget ripgrep fd-find jq tree vim nano tmux htop \
-    build-essential cmake python3 python3-pip python3-venv nodejs npm sqlite3 \
-    unzip zip rsync openssh-client bash-completion less locales pkg-config \
+    ca-certificates sudo git curl wget gnupg ripgrep fd-find jq tree vim nano tmux htop \
+    build-essential cmake python3 python3-pip python3-venv sqlite3 unzip zip rsync \
+    openssh-client bash-completion less locales pkg-config \
   && rm -rf /var/lib/apt/lists/* \
   && ln -sf /usr/bin/fdfind /usr/local/bin/fd
+
+RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
+  && apt-get install -y --no-install-recommends nodejs \
+  && rm -rf /var/lib/apt/lists/*
+
+RUN npm install -g \
+    @earendil-works/pi-coding-agent \
+    @openai/codex \
+    @anthropic-ai/claude-code \
+    @google/gemini-cli \
+  && npm cache clean --force
 
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
   | CARGO_HOME=/opt/cargo RUSTUP_HOME=/opt/rustup sh -s -- -y --profile minimal --no-modify-path \
@@ -99,14 +117,16 @@ paths = [".aim", ".env", ".env.local"]
 # username = "dev"
 # uid = 1000
 # gid = 1000
+
+[share]
+agents = []
+ssh = { enabled = false, host = false, readonly = false }
+dirs = []
+files = []
 """
 
-GLOBAL_CONFIG = """# User-local aim config. Personal resources only; do not commit.
-
-[allow]
-ssh = []
-auth = []
-dirs = []
+GLOBAL_CONFIG = """# User-local aim config. Reserved for future personal defaults.
+# Active shares are project-local in .aim/config.toml.
 """
 
 LEGACY_UID_BLOCK = '''RUN set -eux; \\
@@ -157,22 +177,21 @@ def global_config_path() -> Path:
 
 
 def ensure_global() -> None:
-    GLOBAL_DIR.mkdir(parents=True, exist_ok=True)
-    for sub in ("ssh", "auth", "empty"):
-        (GLOBAL_DIR / sub).mkdir(exist_ok=True)
+    (GLOBAL_DIR / "share" / "agents").mkdir(parents=True, exist_ok=True)
+    (GLOBAL_DIR / "share" / "ssh").mkdir(parents=True, exist_ok=True)
     cfg = global_config_path()
     if not cfg.exists():
         cfg.write_text(GLOBAL_CONFIG)
 
 
-def ensure_project(root: Path) -> None:
+def ensure_project(root: Path, *, force: bool = False) -> None:
     pdir = project_aim_dir(root)
     pdir.mkdir(exist_ok=True)
     df = dockerfile_path(root)
     cfg = project_config_path(root)
-    if not df.exists():
+    if force or not df.exists():
         df.write_text(DOCKERFILE)
-        console.print(f"[green]created[/] {df}")
+        console.print(f"[green]{'updated' if force else 'created'}[/] {df}")
     else:
         text = df.read_text()
         if LEGACY_UID_BLOCK in text:
@@ -226,10 +245,10 @@ def save_project(root: Path, data: dict[str, Any]) -> None:
 
 def save_global(data: dict[str, Any]) -> None:
     ensure_global()
-    write_toml(global_config_path(), data, "# User-local aim config. Personal resources only; do not commit.")
+    write_toml(global_config_path(), data, "# User-local aim config. Reserved for future personal defaults.")
 
 
-def run(args: list[str], *, capture: bool = False, check: bool = True) -> subprocess.CompletedProcess[str]:
+def run_process(args: list[str], *, capture: bool = False, check: bool = True) -> subprocess.CompletedProcess[str]:
     kwargs: dict[str, Any] = {"text": True}
     if capture:
         kwargs.update(stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -243,7 +262,7 @@ def run(args: list[str], *, capture: bool = False, check: bool = True) -> subpro
 
 def docker(args: list[str], *, capture: bool = False, check: bool = True) -> subprocess.CompletedProcess[str]:
     try:
-        return run(["docker", *args], capture=capture, check=check)
+        return run_process(["docker", *args], capture=capture, check=check)
     except FileNotFoundError:
         console.print("[red]docker binary not found[/]")
         raise typer.Exit(1)
@@ -251,7 +270,7 @@ def docker(args: list[str], *, capture: bool = False, check: bool = True) -> sub
 
 def docker_ok() -> bool:
     try:
-        return run(["docker", "info"], capture=True, check=False).returncode == 0
+        return run_process(["docker", "info"], capture=True, check=False).returncode == 0
     except FileNotFoundError:
         return False
 
@@ -285,7 +304,8 @@ def container_running(name: str) -> bool:
 
 
 def container_label(name: str, label: str) -> str:
-    out = docker(["inspect", "-f", "{{ index .Config.Labels " + json.dumps(label) + " }}", name], capture=True, check=False)
+    tmpl = "{{ index .Config.Labels " + json.dumps(label) + " }}"
+    out = docker(["inspect", "-f", tmpl, name], capture=True, check=False)
     return out.stdout.strip() if out.returncode == 0 else ""
 
 
@@ -309,21 +329,15 @@ def build_image(root: Path, *, force: bool = False) -> None:
     if not force and image_exists(image):
         return
     console.print(f"[cyan]building[/] {image}")
-    args = [
+    docker([
         "build",
-        "-t",
-        image,
-        "-f",
-        str(dockerfile_path(root)),
-        "--build-arg",
-        f"USERNAME={username}",
-        "--build-arg",
-        f"UID={uid}",
-        "--build-arg",
-        f"GID={gid}",
+        "-t", image,
+        "-f", str(dockerfile_path(root)),
+        "--build-arg", f"USERNAME={username}",
+        "--build-arg", f"UID={uid}",
+        "--build-arg", f"GID={gid}",
         str(project_aim_dir(root)),
-    ]
-    docker(args)
+    ])
 
 
 def network_args(config: dict[str, Any]) -> list[str]:
@@ -333,9 +347,8 @@ def network_args(config: dict[str, Any]) -> list[str]:
         return ["--network", "none"]
     if mode == "host" or (mode == "auto" and platform.system() == "Linux"):
         return ["--network", "host"]
-    ports = net.get("ports", DEFAULT_PORTS)
     args: list[str] = []
-    for port in ports:
+    for port in net.get("ports", DEFAULT_PORTS):
         p = int(port)
         args += ["-p", f"127.0.0.1:{p}:{p}"]
     return args
@@ -348,6 +361,14 @@ def mount_arg(source: Path | str, target: str, *, readonly: bool = False, kind: 
     if readonly:
         spec += ",readonly"
     return ["--mount", spec]
+
+
+def container_path(path: str, username: str) -> str:
+    if path == "~":
+        return f"/home/{username}"
+    if path.startswith("~/"):
+        return f"/home/{username}/{path[2:]}"
+    return path
 
 
 def ignore_paths(root: Path, config: dict[str, Any]) -> list[str]:
@@ -371,7 +392,16 @@ def ignore_paths(root: Path, config: dict[str, Any]) -> list[str]:
     return clean
 
 
-def all_mounts(root: Path, config: dict[str, Any], global_config: dict[str, Any], username: str) -> list[str]:
+def share_config(config: dict[str, Any]) -> dict[str, Any]:
+    share = config.setdefault("share", {})
+    share.setdefault("agents", [])
+    share.setdefault("ssh", {"enabled": False, "host": False, "readonly": False})
+    share.setdefault("dirs", [])
+    share.setdefault("files", [])
+    return share
+
+
+def all_mounts(root: Path, config: dict[str, Any], username: str) -> list[str]:
     args: list[str] = []
     args += mount_arg(root, str(root))
 
@@ -383,42 +413,56 @@ def all_mounts(root: Path, config: dict[str, Any], global_config: dict[str, Any]
         elif host_path.is_file():
             args += mount_arg("/dev/null", target, readonly=True)
 
-    allow = global_config.get("allow", {})
+    share = share_config(config)
     home = f"/home/{username}"
 
-    ssh_names = list(allow.get("ssh", []))
-    if len(ssh_names) > 1:
-        console.print("[yellow]multiple SSH profiles configured; mounting the first one only[/]")
-    if ssh_names:
-        src = GLOBAL_DIR / "ssh" / str(ssh_names[0])
+    ssh = share.get("ssh", {})
+    if isinstance(ssh, dict) and ssh.get("enabled"):
+        src = Path.home() / ".ssh" if ssh.get("host") else GLOBAL_DIR / "share" / "ssh"
         src.mkdir(parents=True, exist_ok=True)
-        args += mount_arg(src, f"{home}/.ssh", readonly=True)
+        args += mount_arg(src, f"{home}/.ssh", readonly=bool(ssh.get("readonly", False)))
 
-    for auth in allow.get("auth", []):
-        name = str(auth)
-        src = GLOBAL_DIR / "auth" / name
+    for item in share.get("agents", []):
+        if isinstance(item, str):
+            item = {"name": item, "host": False}
+        if not isinstance(item, dict) or "name" not in item:
+            continue
+        name = str(item["name"])
+        target_dir = AGENT_DIRS.get(name, f".{name}")
+        src = Path.home() / target_dir if item.get("host") else GLOBAL_DIR / "share" / "agents" / name
         src.mkdir(parents=True, exist_ok=True)
-        target = AUTH_TARGETS.get(name, f".{name}")
-        args += mount_arg(src, f"{home}/{target}")
+        args += mount_arg(src, f"{home}/{target_dir}")
 
-    for item in allow.get("dirs", []):
+    for item in share.get("dirs", []):
         if not isinstance(item, dict) or "path" not in item:
             continue
         src = Path(str(item["path"])).expanduser().resolve()
-        if not src.exists():
-            console.print(f"[yellow]skipping missing allowed dir[/] {src}")
+        if not src.is_dir():
+            console.print(f"[yellow]skipping missing shared dir[/] {src}")
             continue
-        args += mount_arg(src, str(src), readonly=bool(item.get("readonly", False)))
+        target = str(item.get("target") or src)
+        args += mount_arg(src, container_path(target, username), readonly=bool(item.get("readonly", False)))
+
+    for item in share.get("files", []):
+        if not isinstance(item, dict) or "path" not in item:
+            continue
+        src = Path(str(item["path"])).expanduser().resolve()
+        if not src.is_file():
+            console.print(f"[yellow]skipping missing shared file[/] {src}")
+            continue
+        target = str(item.get("target") or src)
+        args += mount_arg(src, container_path(target, username), readonly=bool(item.get("readonly", False)))
+
     return args
 
 
-def desired_hash(root: Path, config: dict[str, Any], global_config: dict[str, Any], username: str) -> str:
+def desired_hash(root: Path, config: dict[str, Any], username: str) -> str:
     payload = {
         "root": str(root),
         "image": image_name(root),
         "user": username,
         "network": network_args(config),
-        "mounts": all_mounts(root, config, global_config, username),
+        "mounts": all_mounts(root, config, username),
     }
     return hashlib.sha1(json.dumps(payload, sort_keys=True).encode()).hexdigest()
 
@@ -433,10 +477,9 @@ def ensure_container(root: Path) -> None:
     ensure_project(root)
     build_image(root)
     cfg = load_toml(project_config_path(root))
-    global_cfg = load_toml(global_config_path())
     username, _uid, _gid = user_spec(cfg)
     name = container_name(root)
-    desired = desired_hash(root, cfg, global_cfg, username)
+    desired = desired_hash(root, cfg, username)
 
     if container_exists(name):
         current = container_label(name, "aim.config")
@@ -451,55 +494,43 @@ def ensure_container(root: Path) -> None:
 
     home = f"/home/{username}"
     args = [
-        "run",
-        "-d",
-        "--name",
-        name,
-        "--hostname",
-        "aim",
-        "--label",
-        "aim.managed=1",
-        "--label",
-        f"aim.project={root}",
-        "--label",
-        f"aim.config={desired}",
-        "--user",
-        username,
-        "-e",
-        f"HOME={home}",
-        "-e",
-        "TERM=xterm-256color",
-        "-w",
-        str(root),
+        "run", "-d",
+        "--name", name,
+        "--hostname", "aim",
+        "--label", "aim.managed=1",
+        "--label", f"aim.project={root}",
+        "--label", f"aim.config={desired}",
+        "--user", username,
+        "-e", f"HOME={home}",
+        "-e", "TERM=xterm-256color",
+        "-w", str(root),
         *network_args(cfg),
-        *all_mounts(root, cfg, global_cfg, username),
+        *all_mounts(root, cfg, username),
         image_name(root),
-        "sleep",
-        "infinity",
+        "sleep", "infinity",
     ]
     console.print(f"[cyan]starting[/] {name}")
     docker(args)
 
 
-def enter_shell(root: Path) -> None:
+def docker_exec(root: Path, command: list[str]) -> None:
     cfg = load_toml(project_config_path(root))
     username, _uid, _gid = user_spec(cfg)
     args = ["docker", "exec"]
     args.append("-it" if sys.stdin.isatty() and sys.stdout.isatty() else "-i")
     args += [
-        "--user",
-        username,
-        "-e",
-        f"HOME=/home/{username}",
-        "-e",
-        "TERM=xterm-256color",
-        "-w",
-        str(root),
+        "--user", username,
+        "-e", f"HOME=/home/{username}",
+        "-e", "TERM=xterm-256color",
+        "-w", str(root),
         container_name(root),
-        "bash",
-        "-l",
+        *command,
     ]
     raise typer.Exit(subprocess.call(args))
+
+
+def enter_shell(root: Path) -> None:
+    docker_exec(root, ["bash", "-l"])
 
 
 def launch() -> None:
@@ -518,11 +549,26 @@ def main(ctx: typer.Context) -> None:
 
 
 @app.command()
-def init() -> None:
+def init(force: bool = typer.Option(False, "--force", help="Overwrite .aim/Dockerfile with the current default.")) -> None:
     """Create .aim/Dockerfile and .aim/config.toml if missing."""
     ensure_global()
-    ensure_project(project_root())
+    ensure_project(project_root(), force=force)
     console.print("[green]aim initialized[/]")
+
+
+@app.command(context_settings={"allow_extra_args": True, "ignore_unknown_options": True})
+def run(ctx: typer.Context) -> None:
+    """Ensure the workspace is running, then execute a command inside it."""
+    command = list(ctx.args)
+    if not command:
+        console.print("[red]usage:[/] aim run COMMAND [ARGS]...")
+        raise typer.Exit(2)
+    if not docker_ok():
+        console.print("[red]Docker is not available or the daemon is not running.[/]")
+        raise typer.Exit(1)
+    root = project_root()
+    ensure_container(root)
+    docker_exec(root, command)
 
 
 @app.command()
@@ -537,14 +583,10 @@ def rebuild(no_cache: bool = typer.Option(False, "--no-cache", help="Disable Doc
     if no_cache:
         args.append("--no-cache")
     args += [
-        "-f",
-        str(dockerfile_path(root)),
-        "--build-arg",
-        f"USERNAME={username}",
-        "--build-arg",
-        f"UID={uid}",
-        "--build-arg",
-        f"GID={gid}",
+        "-f", str(dockerfile_path(root)),
+        "--build-arg", f"USERNAME={username}",
+        "--build-arg", f"UID={uid}",
+        "--build-arg", f"GID={gid}",
         str(project_aim_dir(root)),
     ]
     docker(args)
@@ -577,6 +619,53 @@ def list_workspaces() -> None:
     docker(["ps", "-a", "--filter", "label=aim.managed=1", "--format", "table {{.Names}}\t{{.Status}}\t{{.Image}}"])
 
 
+def symlink_target(path: Path) -> Path:
+    raw = Path(os.readlink(path))
+    if not raw.is_absolute():
+        raw = path.parent / raw
+    return raw.resolve(strict=False)
+
+
+def outside_symlinks(root: Path, *, limit: int = 20) -> list[tuple[Path, Path]]:
+    found: list[tuple[Path, Path]] = []
+    try:
+        paths = root.rglob("*")
+        for path in paths:
+            if len(found) >= limit:
+                break
+            try:
+                if not path.is_symlink():
+                    continue
+                target = symlink_target(path)
+                if not target.is_relative_to(root):
+                    found.append((path, target))
+            except OSError:
+                continue
+    except OSError:
+        pass
+    return found
+
+
+def doctor_share_warnings(config: dict[str, Any]) -> list[str]:
+    share = share_config(config)
+    warnings: list[str] = []
+    for item in share.get("agents", []):
+        if isinstance(item, str):
+            continue
+        if isinstance(item, dict) and item.get("host"):
+            warnings.append(f"agent {item.get('name')} uses the real host directory")
+    ssh = share.get("ssh", {})
+    if isinstance(ssh, dict) and ssh.get("enabled"):
+        warnings.append("ssh is shared with the container" + (" from real ~/.ssh" if ssh.get("host") else ""))
+    for item in share.get("dirs", []):
+        if isinstance(item, dict) and not item.get("readonly", False):
+            warnings.append(f"directory is shared read-write: {item.get('path')}")
+    for item in share.get("files", []):
+        if isinstance(item, dict) and not item.get("readonly", False):
+            warnings.append(f"file is shared read-write: {item.get('path')}")
+    return warnings
+
+
 @app.command()
 def doctor() -> None:
     """Check Docker and local aim configuration."""
@@ -593,62 +682,226 @@ def doctor() -> None:
         console.print("[red]docker daemon not reachable[/]")
         ok = False
     root = project_root()
-    console.print(f"project: {root}")
-    console.print(f"config:  {project_config_path(root)}")
+    cfg = load_toml(project_config_path(root))
+    console.print(f"project:        {root}")
+    console.print(f"project config: {project_config_path(root)}")
+    console.print(f"user storage:   {GLOBAL_DIR / 'share'}")
+
+    outside = outside_symlinks(root)
+    if outside:
+        console.print("[yellow]outside-project symlinks:[/]")
+        for path, target in outside:
+            console.print(f"  {path.relative_to(root)} -> {target}")
+
+    warnings = doctor_share_warnings(cfg)
+    if warnings:
+        console.print("[yellow]share warnings:[/]")
+        for warning in warnings:
+            console.print(f"  {warning}")
+
+    net_mode = str(cfg.get("network", {}).get("mode", "auto"))
+    if net_mode in {"auto", "host"} and platform.system() == "Linux":
+        console.print("[dim]network: host networking; use `aim network bridge` for more isolation.[/]")
+
     raise typer.Exit(0 if ok else 1)
 
 
-@allow_app.command("ssh")
-def allow_ssh(name: str) -> None:
-    """Allow ~/.aim/ssh/NAME as ~/.ssh inside the container."""
+def print_shares(path: Path, cfg: dict[str, Any]) -> None:
+    share = share_config(cfg)
+    console.print(f"config: [bold]{path}[/]")
+
+    agents = share.get("agents", [])
+    console.print("\n[bold]agents[/]")
+    if agents:
+        for item in agents:
+            if isinstance(item, str):
+                name, host = item, False
+            else:
+                name, host = str(item.get("name")), bool(item.get("host", False))
+            target_dir = AGENT_DIRS.get(name, f".{name}")
+            src = Path.home() / target_dir if host else GLOBAL_DIR / "share" / "agents" / name
+            console.print(f"  {name}: {src} -> ~/{target_dir}{' [host]' if host else ''}")
+    else:
+        console.print("  none")
+
+    ssh = share.get("ssh", {})
+    console.print("\n[bold]ssh[/]")
+    if isinstance(ssh, dict) and ssh.get("enabled"):
+        src = Path.home() / ".ssh" if ssh.get("host") else GLOBAL_DIR / "share" / "ssh"
+        console.print(f"  {src} -> ~/.ssh ({'ro' if ssh.get('readonly') else 'rw'}{' host' if ssh.get('host') else ''})")
+    else:
+        console.print("  none")
+
+    console.print("\n[bold]dirs[/]")
+    dirs = share.get("dirs", [])
+    if dirs:
+        for item in dirs:
+            if isinstance(item, dict):
+                console.print(f"  {item.get('path')} -> {item.get('target') or item.get('path')} ({'ro' if item.get('readonly') else 'rw'})")
+    else:
+        console.print("  none")
+
+    console.print("\n[bold]files[/]")
+    files = share.get("files", [])
+    if files:
+        for item in files:
+            if isinstance(item, dict):
+                console.print(f"  {item.get('path')} -> {item.get('target') or item.get('path')} ({'ro' if item.get('readonly') else 'rw'})")
+    else:
+        console.print("  none")
+
+
+@share_app.command("list")
+def share_list() -> None:
+    """List currently shared resources for this project."""
+    root = project_root()
+    ensure_project(root)
+    print_shares(project_config_path(root), load_toml(project_config_path(root)))
+
+
+@share_app.command("agent")
+def share_agent(name: str, host: bool = typer.Option(False, "--host/--managed", help="Use the real host agent directory instead of ~/.aim/share/agents/NAME.")) -> None:
+    """Share persistent state/config for an AI CLI in this project."""
     ensure_global()
-    cfg = load_toml(global_config_path())
-    allow = cfg.setdefault("allow", {})
-    items = list(allow.get("ssh", []))
-    if name not in items:
-        items.append(name)
-    allow["ssh"] = items
-    path = GLOBAL_DIR / "ssh" / name
-    path.mkdir(parents=True, exist_ok=True)
-    save_global(cfg)
-    console.print(f"[green]allowed ssh[/] {name} -> {path}")
+    root = project_root()
+    ensure_project(root)
+    cfg = load_toml(project_config_path(root))
+    share = share_config(cfg)
+    agents = [a for a in share.get("agents", []) if not (isinstance(a, dict) and a.get("name") == name) and a != name]
+    agents.append({"name": name, "host": bool(host)})
+    share["agents"] = agents
+    target_dir = AGENT_DIRS.get(name, f".{name}")
+    src = Path.home() / target_dir if host else GLOBAL_DIR / "share" / "agents" / name
+    src.mkdir(parents=True, exist_ok=True)
+    save_project(root, cfg)
+    console.print(f"[green]shared agent[/] {name}: {src} -> ~/{target_dir}")
 
 
-@allow_app.command("auth")
-def allow_auth(name: str) -> None:
-    """Allow ~/.aim/auth/NAME as the matching tool auth directory."""
+@share_app.command("ssh")
+def share_ssh(
+    host: bool = typer.Option(False, "--host/--managed", help="Use real ~/.ssh instead of ~/.aim/share/ssh."),
+    ro: bool = typer.Option(False, "--ro/--rw", help="Mount SSH read-only/read-write."),
+) -> None:
+    """Share SSH identity/config as ~/.ssh inside this project's container."""
     ensure_global()
-    cfg = load_toml(global_config_path())
-    allow = cfg.setdefault("allow", {})
-    items = list(allow.get("auth", []))
-    if name not in items:
-        items.append(name)
-    allow["auth"] = items
-    path = GLOBAL_DIR / "auth" / name
-    path.mkdir(parents=True, exist_ok=True)
-    save_global(cfg)
-    console.print(f"[green]allowed auth[/] {name} -> {path}")
+    root = project_root()
+    ensure_project(root)
+    cfg = load_toml(project_config_path(root))
+    share = share_config(cfg)
+    share["ssh"] = {"enabled": True, "host": bool(host), "readonly": bool(ro)}
+    src = Path.home() / ".ssh" if host else GLOBAL_DIR / "share" / "ssh"
+    src.mkdir(parents=True, exist_ok=True)
+    save_project(root, cfg)
+    console.print(f"[green]shared ssh[/] {src} -> ~/.ssh ({'ro' if ro else 'rw'})")
 
 
-@allow_app.command("dir")
-def allow_dir(path: str, ro: bool = typer.Option(False, "--ro/--rw", help="Mount read-only/read-write.")) -> None:
-    """Allow a host directory at the same absolute path inside the container."""
+@share_app.command("dir")
+def share_dir(
+    path: str,
+    target: str | None = typer.Option(None, "--target", "-t", help="Container target path. Defaults to the same absolute path."),
+    ro: bool = typer.Option(False, "--ro/--rw", help="Mount read-only/read-write."),
+) -> None:
+    """Share a real host directory with this project's container."""
     ensure_global()
+    root = project_root()
+    ensure_project(root)
     src = Path(path).expanduser().resolve()
-    if not src.exists() or not src.is_dir():
+    if not src.is_dir():
         console.print(f"[red]not a directory:[/] {src}")
         raise typer.Exit(1)
-    cfg = load_toml(global_config_path())
-    allow = cfg.setdefault("allow", {})
-    dirs = [d for d in allow.get("dirs", []) if not (isinstance(d, dict) and d.get("path") == str(src))]
-    dirs.append({"path": str(src), "readonly": bool(ro)})
-    allow["dirs"] = dirs
-    save_global(cfg)
-    console.print(f"[green]allowed dir[/] {src} ({'ro' if ro else 'rw'})")
+    cfg = load_toml(project_config_path(root))
+    share = share_config(cfg)
+    dirs = [d for d in share.get("dirs", []) if not (isinstance(d, dict) and d.get("path") == str(src))]
+    item: dict[str, Any] = {"path": str(src), "readonly": bool(ro)}
+    if target:
+        item["target"] = target
+    dirs.append(item)
+    share["dirs"] = dirs
+    save_project(root, cfg)
+    console.print(f"[green]shared dir[/] {src} -> {target or src} ({'ro' if ro else 'rw'})")
 
 
-@allow_app.command("port")
-def allow_port(port: int) -> None:
+@share_app.command("file")
+def share_file(
+    path: str,
+    target: str | None = typer.Option(None, "--target", "-t", help="Container target path. Defaults to the same absolute path."),
+    ro: bool = typer.Option(False, "--ro/--rw", help="Mount read-only/read-write."),
+) -> None:
+    """Share a real host file with this project's container."""
+    ensure_global()
+    root = project_root()
+    ensure_project(root)
+    src = Path(path).expanduser().resolve()
+    if not src.is_file():
+        console.print(f"[red]not a file:[/] {src}")
+        raise typer.Exit(1)
+    cfg = load_toml(project_config_path(root))
+    share = share_config(cfg)
+    files = [f for f in share.get("files", []) if not (isinstance(f, dict) and f.get("path") == str(src))]
+    item: dict[str, Any] = {"path": str(src), "readonly": bool(ro)}
+    if target:
+        item["target"] = target
+    files.append(item)
+    share["files"] = files
+    save_project(root, cfg)
+    console.print(f"[green]shared file[/] {src} -> {target or src} ({'ro' if ro else 'rw'})")
+
+
+@unshare_app.command("agent")
+def unshare_agent(name: str) -> None:
+    """Stop sharing persistent state/config for an AI CLI in this project."""
+    root = project_root()
+    ensure_project(root)
+    cfg = load_toml(project_config_path(root))
+    share = share_config(cfg)
+    before = len(share.get("agents", []))
+    share["agents"] = [a for a in share.get("agents", []) if not (a == name or (isinstance(a, dict) and a.get("name") == name))]
+    save_project(root, cfg)
+    console.print(f"[green]unshared agent[/] {name}" if len(share["agents"]) != before else f"[yellow]agent was not shared[/] {name}")
+
+
+@unshare_app.command("ssh")
+def unshare_ssh() -> None:
+    """Stop sharing SSH identity/config in this project."""
+    root = project_root()
+    ensure_project(root)
+    cfg = load_toml(project_config_path(root))
+    share = share_config(cfg)
+    share["ssh"] = {"enabled": False, "host": False, "readonly": False}
+    save_project(root, cfg)
+    console.print("[green]unshared ssh[/]")
+
+
+@unshare_app.command("dir")
+def unshare_dir(path: str) -> None:
+    """Stop sharing a host directory in this project."""
+    root = project_root()
+    ensure_project(root)
+    src = str(Path(path).expanduser().resolve())
+    cfg = load_toml(project_config_path(root))
+    share = share_config(cfg)
+    before = len(share.get("dirs", []))
+    share["dirs"] = [d for d in share.get("dirs", []) if not (isinstance(d, dict) and d.get("path") == src)]
+    save_project(root, cfg)
+    console.print(f"[green]unshared dir[/] {src}" if len(share["dirs"]) != before else f"[yellow]dir was not shared[/] {src}")
+
+
+@unshare_app.command("file")
+def unshare_file(path: str) -> None:
+    """Stop sharing a host file in this project."""
+    root = project_root()
+    ensure_project(root)
+    src = str(Path(path).expanduser().resolve())
+    cfg = load_toml(project_config_path(root))
+    share = share_config(cfg)
+    before = len(share.get("files", []))
+    share["files"] = [f for f in share.get("files", []) if not (isinstance(f, dict) and f.get("path") == src)]
+    save_project(root, cfg)
+    console.print(f"[green]unshared file[/] {src}" if len(share["files"]) != before else f"[yellow]file was not shared[/] {src}")
+
+
+@expose_app.command("port")
+def expose_port(port: int) -> None:
     """Expose a development port when not using host networking."""
     root = project_root()
     ensure_project(root)
@@ -659,7 +912,7 @@ def allow_port(port: int) -> None:
         ports.append(port)
     net["ports"] = sorted(ports)
     save_project(root, cfg)
-    console.print(f"[green]allowed port[/] {port}")
+    console.print(f"[green]exposed port[/] {port}")
 
 
 @network_app.command("off")
