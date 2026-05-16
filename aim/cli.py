@@ -45,6 +45,7 @@ AGENT_DIRS = {
 DOCKERFILE = r"""# aim default Dockerfile v2
 FROM ubuntu:24.04
 
+# Fallbacks only. AiMount overrides these with your host username/UID/GID at build time.
 ARG USERNAME=aim
 ARG UID=1000
 ARG GID=1000
