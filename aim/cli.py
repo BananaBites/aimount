@@ -66,13 +66,6 @@ RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
   && apt-get install -y --no-install-recommends nodejs \
   && rm -rf /var/lib/apt/lists/*
 
-RUN npm install -g \
-    @earendil-works/pi-coding-agent \
-    @openai/codex \
-    @anthropic-ai/claude-code \
-    @google/gemini-cli \
-  && npm cache clean --force
-
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
   | CARGO_HOME=/opt/cargo RUSTUP_HOME=/opt/rustup sh -s -- -y --profile minimal --no-modify-path \
   && chmod -R a+rwX /opt/cargo /opt/rustup
@@ -91,16 +84,29 @@ RUN set -eux; \
     usermod -g "${GID}" "${USERNAME}"; \
     mkdir -p "/home/${USERNAME}"; \
     chown -R "${UID}:${GID}" "/home/${USERNAME}"; \
+    mkdir -p "/home/${USERNAME}/.npm-global"; \
+    chown -R "${UID}:${GID}" "/home/${USERNAME}/.npm-global"; \
     echo "${USERNAME} ALL=(ALL) NOPASSWD:ALL" > "/etc/sudoers.d/${USERNAME}"; \
     chmod 0440 "/etc/sudoers.d/${USERNAME}"
 
+ENV NPM_CONFIG_PREFIX=/home/${USERNAME}/.npm-global \
+    PATH=/home/${USERNAME}/.npm-global/bin:/opt/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
 RUN printf '%s\n' \
-  'export PATH="/opt/cargo/bin:$PATH"' \
+  'export PATH="$HOME/.npm-global/bin:/opt/cargo/bin:$PATH"' \
   'if [ -n "$PS1" ]; then' \
   '  export PS1="\[\e[1;36m\]aim\[\e[0m\] \[\e[1;32m\]\u@\h\[\e[0m\]:\[\e[1;34m\]\w\[\e[0m\]\\$ "' \
   'fi' > /etc/profile.d/aim.sh
 
 USER ${USERNAME}
+
+RUN npm install -g \
+    @earendil-works/pi-coding-agent \
+    @openai/codex \
+    @anthropic-ai/claude-code \
+    @google/gemini-cli \
+  && npm cache clean --force
+
 WORKDIR /home/${USERNAME}
 CMD ["bash"]
 """
@@ -530,6 +536,7 @@ def ensure_container(root: Path) -> None:
         "run", "-d",
         "--name", name,
         "--hostname", "aim",
+        "--add-host", "aim:127.0.0.1",
         "--label", "aim.managed=1",
         "--label", f"aim.project={root}",
         "--label", f"aim.config={desired}",

@@ -27,10 +27,26 @@ pip install git+https://github.com/BananaBites/aimount.git
 pipx install git+https://github.com/BananaBites/aimount.git
 ```
 
+For private repositories, use SSH:
+
+```bash
+pip install git+ssh://git@github.com/BananaBites/aimount.git
+# or
+pipx install git+ssh://git@github.com/BananaBites/aimount.git
+```
+
 Pinned to a tag/branch:
 
 ```bash
-pip install git+https://github.com/BananaBites/aimount.git@v0.4.0
+pip install git+ssh://git@github.com/BananaBites/aimount.git@v0.4.1
+```
+
+Update to the latest version:
+
+```bash
+pip install --upgrade --force-reinstall git+ssh://git@github.com/BananaBites/aimount.git
+# or, for pipx
+pipx install --force git+ssh://git@github.com/BananaBites/aimount.git
 ```
 
 

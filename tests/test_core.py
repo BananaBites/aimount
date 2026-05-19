@@ -41,6 +41,7 @@ def test_init_creates_project_files_with_agent_tools(workspace: tuple[Path, Path
     assert "@openai/codex" in dockerfile
     assert "@anthropic-ai/claude-code" in dockerfile
     assert "@google/gemini-cli" in dockerfile
+    assert "NPM_CONFIG_PREFIX=/home/${USERNAME}/.npm-global" in dockerfile
 
 
 def test_share_agent_is_project_local_and_uses_managed_storage(workspace: tuple[Path, Path]) -> None:
@@ -195,6 +196,8 @@ def test_ensure_container_builds_expected_docker_run_args(
     specs = mount_specs(run_args)
 
     assert "--name" in run_args
+    assert "--add-host" in run_args
+    assert "aim:127.0.0.1" in run_args
     assert f"aim.project={project}" in run_args
     assert "-p" in run_args
     assert "127.0.0.1:3000:3000" in run_args
