@@ -9,6 +9,25 @@ while only sharing host resources you explicitly choose.
 It is a developer convenience/containment tool, not a hardened sandbox.
 
 
+## Security model
+
+AiMount reduces accidental host access by putting agent tools in a Docker
+workspace and mounting only selected host paths. It is not a security boundary
+against malicious code or hostile container workloads.
+
+Important implications:
+
+- The current project is mounted read-write into the container.
+- Shared agents, SSH keys, directories, and files can expose credentials or
+  private data to tools running in the container.
+- On Linux, the default `network.mode = "auto"` uses host networking for
+  convenience. Use `aim network bridge` or `aim network off` for more isolation.
+- Container-local changes outside mounted paths can be discarded when the
+  container is rebuilt or updated. Put persistent setup in `.aim/Dockerfile`.
+
+Run `aim doctor` to review sharing and isolation warnings for a project.
+
+
 ## Install
 
 From a local checkout:
@@ -174,3 +193,8 @@ Config/state lives in:
 - project config/container definition: `.aim/`
 - reusable private shared data: `~/.aim/share/`
 - user config: `~/.aim/config.toml` is reserved for future defaults
+
+
+## License
+
+MIT. See [LICENSE](LICENSE).
