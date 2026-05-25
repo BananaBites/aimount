@@ -9,12 +9,14 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 import tomllib
 from pathlib import Path
 from typing import Any
 
 import typer
 from rich.console import Console
+from rich.markup import escape
 
 app = typer.Typer(
     invoke_without_command=True,
@@ -100,7 +102,9 @@ RUN printf '%s\n' \
 
 USER ${USERNAME}
 
-RUN npm install -g \
+ARG AIM_TOOLS_REFRESH=0
+RUN echo "aim tools refresh: ${AIM_TOOLS_REFRESH}" >/tmp/aim-tools-refresh \
+  && npm install -g \
     @earendil-works/pi-coding-agent \
     @openai/codex \
     @anthropic-ai/claude-code \
@@ -164,6 +168,55 @@ FIXED_UID_BLOCK = '''RUN set -eux; \\
     chmod 0440 "/etc/sudoers.d/${USERNAME}"
 '''
 
+LEGACY_TOOLS_BLOCK = '''USER ${USERNAME}
+
+RUN npm install -g \\
+    @earendil-works/pi-coding-agent \\
+'''
+
+TOOLS_REFRESH_BLOCK = '''USER ${USERNAME}
+
+ARG AIM_TOOLS_REFRESH=0
+RUN echo "aim tools refresh: ${AIM_TOOLS_REFRESH}" >/tmp/aim-tools-refresh \\
+  && npm install -g \\
+    @earendil-works/pi-coding-agent \\
+'''
+
+SYSTEM_CHANGE_PREFIXES = (
+    "/usr",
+    "/etc",
+    "/opt",
+    "/bin",
+    "/sbin",
+    "/lib",
+    "/lib64",
+    "/var/lib/apt",
+    "/var/lib/dpkg",
+    "/var/log/apt",
+)
+
+DOCKER_MANAGED_PATHS = (
+    "/etc/hostname",
+    "/etc/hosts",
+    "/etc/resolv.conf",
+)
+
+NOISY_PARENT_CHANGE_PATHS = (
+    "/etc",
+    "/usr",
+    "/usr/bin",
+    "/usr/lib",
+    "/usr/local",
+    "/var",
+    "/var/lib",
+    "/var/log",
+    "/opt",
+    "/bin",
+    "/sbin",
+    "/lib",
+    "/lib64",
+)
+
 
 def project_root() -> Path:
     return Path.cwd().resolve()
@@ -203,9 +256,17 @@ def ensure_project(root: Path, *, force: bool = False) -> None:
         console.print(f"[green]{'updated' if force else 'created'}[/] {df}")
     else:
         text = df.read_text()
-        if LEGACY_UID_BLOCK in text:
-            df.write_text(text.replace(LEGACY_UID_BLOCK, FIXED_UID_BLOCK))
-            console.print(f"[green]updated[/] {df} UID handling")
+        updated = text
+        messages: list[str] = []
+        if LEGACY_UID_BLOCK in updated:
+            updated = updated.replace(LEGACY_UID_BLOCK, FIXED_UID_BLOCK)
+            messages.append("UID handling")
+        if "AIM_TOOLS_REFRESH" not in updated and LEGACY_TOOLS_BLOCK in updated:
+            updated = updated.replace(LEGACY_TOOLS_BLOCK, TOOLS_REFRESH_BLOCK)
+            messages.append("tool refresh cache-busting")
+        if updated != text:
+            df.write_text(updated)
+            console.print(f"[green]updated[/] {df} {', '.join(messages)}")
     if not cfg.exists():
         cfg.write_text(PROJECT_CONFIG)
         console.print(f"[green]created[/] {cfg}")
@@ -346,26 +407,57 @@ def build_hash(root: Path, username: str, uid: int, gid: int) -> str:
     return hashlib.sha1(json.dumps(payload, sort_keys=True).encode()).hexdigest()
 
 
-def build_image(root: Path, *, force: bool = False) -> None:
+def docker_build_args(
+    root: Path,
+    username: str,
+    uid: int,
+    gid: int,
+    desired: str,
+    *,
+    no_cache: bool = False,
+    tools_refresh: str | None = None,
+) -> list[str]:
+    args = [
+        "build",
+        "-t", image_name(root),
+        "--label", "aim.managed=1",
+        "--label", f"aim.build={desired}",
+    ]
+    if no_cache:
+        args.append("--no-cache")
+    args += [
+        "-f", str(dockerfile_path(root)),
+        "--build-arg", f"USERNAME={username}",
+        "--build-arg", f"UID={uid}",
+        "--build-arg", f"GID={gid}",
+    ]
+    if tools_refresh is not None:
+        args += ["--build-arg", f"AIM_TOOLS_REFRESH={tools_refresh}"]
+    args.append(str(project_aim_dir(root)))
+    return args
+
+
+def dockerfile_supports_tools_refresh(root: Path) -> bool:
+    text = dockerfile_path(root).read_text()
+    return "ARG AIM_TOOLS_REFRESH" in text and ("${AIM_TOOLS_REFRESH}" in text or "$AIM_TOOLS_REFRESH" in text)
+
+
+def build_image(
+    root: Path,
+    *,
+    force: bool = False,
+    no_cache: bool = False,
+    tools_refresh: str | None = None,
+) -> None:
     ensure_project(root)
     cfg = load_toml(project_config_path(root))
     username, uid, gid = user_spec(cfg)
     image = image_name(root)
     desired = build_hash(root, username, uid, gid)
-    if not force and image_exists(image) and image_label(image, "aim.build") == desired:
+    if not force and not no_cache and tools_refresh is None and image_exists(image) and image_label(image, "aim.build") == desired:
         return
     console.print(f"[cyan]building[/] {image}")
-    docker([
-        "build",
-        "-t", image,
-        "--label", f"aim.managed=1",
-        "--label", f"aim.build={desired}",
-        "-f", str(dockerfile_path(root)),
-        "--build-arg", f"USERNAME={username}",
-        "--build-arg", f"UID={uid}",
-        "--build-arg", f"GID={gid}",
-        str(project_aim_dir(root)),
-    ])
+    docker(docker_build_args(root, username, uid, gid, desired, no_cache=no_cache, tools_refresh=tools_refresh))
 
 
 def network_args(config: dict[str, Any]) -> list[str]:
@@ -418,6 +510,10 @@ def ignore_paths(root: Path, config: dict[str, Any]) -> list[str]:
         seen.add(p)
         clean.append(p)
     return clean
+
+
+def complete_agent_names(incomplete: str = "") -> list[str]:
+    return [name for name in sorted(AGENT_DIRS) if name.startswith(incomplete)]
 
 
 def share_config(config: dict[str, Any]) -> dict[str, Any]:
@@ -482,6 +578,99 @@ def all_mounts(root: Path, config: dict[str, Any], username: str) -> list[str]:
         args += mount_arg(src, container_path(target, username), readonly=bool(item.get("readonly", False)))
 
     return args
+
+
+def configured_mount_targets(root: Path, config: dict[str, Any], username: str) -> list[str]:
+    targets = [str(root)]
+    targets += [str(root / p) for p in ignore_paths(root, config)]
+
+    share = share_config(config)
+    home = f"/home/{username}"
+    ssh = share.get("ssh", {})
+    if isinstance(ssh, dict) and ssh.get("enabled"):
+        targets.append(f"{home}/.ssh")
+
+    for item in share.get("agents", []):
+        if isinstance(item, str):
+            item = {"name": item, "host": False}
+        if isinstance(item, dict) and "name" in item:
+            target_dir = AGENT_DIRS.get(str(item["name"]), f".{item['name']}")
+            targets.append(f"{home}/{target_dir}")
+
+    for key in ("dirs", "files"):
+        for item in share.get(key, []):
+            if isinstance(item, dict) and "path" in item:
+                target = str(item.get("target") or Path(str(item["path"])).expanduser().resolve())
+                targets.append(container_path(target, username))
+
+    seen: set[str] = set()
+    clean: list[str] = []
+    for target in targets:
+        target = "/" + target.strip("/") if target != "/" else "/"
+        if target not in seen:
+            seen.add(target)
+            clean.append(target)
+    return clean
+
+
+def container_mount_targets(name: str) -> list[str]:
+    out = docker(["inspect", "-f", "{{json .Mounts}}", name], capture=True, check=False)
+    if out.returncode != 0 or not out.stdout.strip():
+        return []
+    try:
+        mounts = json.loads(out.stdout)
+    except json.JSONDecodeError:
+        return []
+    targets: list[str] = []
+    for mount in mounts:
+        if isinstance(mount, dict) and mount.get("Destination"):
+            targets.append(str(mount["Destination"]))
+    return targets
+
+
+def path_is_under(path: str, parent: str) -> bool:
+    parent = parent.rstrip("/") or "/"
+    return path == parent or path.startswith(parent.rstrip("/") + "/")
+
+
+def parse_docker_diff(output: str) -> list[tuple[str, str]]:
+    changes: list[tuple[str, str]] = []
+    for line in output.splitlines():
+        line = line.strip()
+        if len(line) < 3 or line[1] != " ":
+            continue
+        status, path = line[0], line[2:]
+        if status in {"A", "C", "D"} and path.startswith("/"):
+            changes.append((status, path))
+    return changes
+
+
+def container_system_changes(root: Path, config: dict[str, Any], username: str, name: str) -> list[tuple[str, str]]:
+    if not container_exists(name):
+        return []
+    out = docker(["diff", name], capture=True, check=False)
+    if out.returncode != 0:
+        return []
+    mount_targets = configured_mount_targets(root, config, username) + container_mount_targets(name)
+    changes = []
+    for status, path in parse_docker_diff(out.stdout):
+        if any(path_is_under(path, target) for target in mount_targets):
+            continue
+        if any(path_is_under(path, ignored) for ignored in DOCKER_MANAGED_PATHS):
+            continue
+        if any(path_is_under(path, prefix) for prefix in SYSTEM_CHANGE_PREFIXES):
+            changes.append((status, path))
+
+    # docker diff can include changed parent directories. For common system
+    # parent directories, keep those only when there is a concrete child change
+    # after filtering Docker-managed files.
+    return [
+        (status, path)
+        for status, path in changes
+        if status != "C"
+        or path not in NOISY_PARENT_CHANGE_PATHS
+        or any(other != path and path_is_under(other, path) for _other_status, other in changes)
+    ]
 
 
 def desired_hash(root: Path, config: dict[str, Any], username: str) -> str:
@@ -611,28 +800,70 @@ def run(ctx: typer.Context) -> None:
     docker_exec(root, command)
 
 
+def print_container_update_warning(changes: list[tuple[str, str]], *, limit: int = 25) -> None:
+    console.print("[yellow]This container appears to have manual system changes that may be lost.[/]")
+    console.print("\nDetected changes:")
+    for status, path in changes[:limit]:
+        console.print(f"  {status} {escape(path)}")
+    if len(changes) > limit:
+        console.print(f"  ... and {len(changes) - limit} more")
+
+    console.print(
+        "\nIf you installed apt packages manually inside the container, add them to "
+        "[bold].aim/Dockerfile[/] instead, for example:\n"
+    )
+    console.print("  RUN apt-get update \\")
+    console.print("      && apt-get install -y --no-install-recommends htop jq \\")
+    console.print("      && rm -rf /var/lib/apt/lists/*")
+    console.print(
+        "\nTo inspect apt history before updating, abort and run:\n"
+        "  aim run -- sh -lc 'cat /var/log/apt/history.log'\n"
+    )
+
+
 @app.command()
 def rebuild(no_cache: bool = typer.Option(False, "--no-cache", help="Disable Docker build cache.")) -> None:
     """Rebuild the project image and recreate the workspace container."""
     root = project_root()
     ensure_global()
     ensure_project(root)
-    image = image_name(root)
-    username, uid, gid = user_spec(load_toml(project_config_path(root)))
-    desired = build_hash(root, username, uid, gid)
-    args = ["build", "-t", image, "--label", "aim.managed=1", "--label", f"aim.build={desired}"]
-    if no_cache:
-        args.append("--no-cache")
-    args += [
-        "-f", str(dockerfile_path(root)),
-        "--build-arg", f"USERNAME={username}",
-        "--build-arg", f"UID={uid}",
-        "--build-arg", f"GID={gid}",
-        str(project_aim_dir(root)),
-    ]
-    docker(args)
+    build_image(root, force=True, no_cache=no_cache)
     remove_container(container_name(root))
     console.print("[green]rebuilt; next `aim` will start a fresh container[/]")
+
+
+@app.command(name="update-container")
+def update_container(
+    discard: bool = typer.Option(False, "--discard", "-y", help="Do not prompt before discarding container-local system changes."),
+    no_cache: bool = typer.Option(False, "--no-cache", help="Disable Docker build cache for the whole image."),
+) -> None:
+    """Refresh preinstalled tools by rebuilding the image and replacing the container."""
+    if not docker_ok():
+        console.print("[red]Docker is not available or the daemon is not running.[/]")
+        raise typer.Exit(1)
+
+    root = project_root()
+    ensure_global()
+    ensure_project(root)
+    cfg = load_toml(project_config_path(root))
+    username, _uid, _gid = user_spec(cfg)
+    name = container_name(root)
+
+    changes = container_system_changes(root, cfg, username, name)
+    if changes:
+        print_container_update_warning(changes)
+        if not discard and not typer.confirm("Continue and discard container-local system changes?", default=False):
+            console.print("[yellow]aborted[/]")
+            raise typer.Exit(1)
+
+    supports_refresh = dockerfile_supports_tools_refresh(root)
+    if not supports_refresh and not no_cache:
+        console.print("[yellow]Dockerfile has no AIM_TOOLS_REFRESH cache-bust hook; using --no-cache.[/]")
+
+    refresh = str(int(time.time())) if supports_refresh and not no_cache else None
+    build_image(root, force=True, no_cache=no_cache or not supports_refresh, tools_refresh=refresh)
+    remove_container(name)
+    console.print("[green]updated container image; next `aim` will start a fresh container[/]")
 
 
 @app.command()
@@ -812,7 +1043,10 @@ def share_list() -> None:
 
 
 @share_app.command("agent")
-def share_agent(name: str, host: bool = typer.Option(False, "--host/--managed", help="Use the real host agent directory instead of ~/.aim/share/agents/NAME.")) -> None:
+def share_agent(
+    name: str = typer.Argument(..., autocompletion=complete_agent_names),
+    host: bool = typer.Option(False, "--host/--managed", help="Use the real host agent directory instead of ~/.aim/share/agents/NAME."),
+) -> None:
     """Share persistent state/config for an AI CLI in this project."""
     ensure_global()
     root = project_root()
@@ -900,7 +1134,7 @@ def share_file(
 
 
 @unshare_app.command("agent")
-def unshare_agent(name: str) -> None:
+def unshare_agent(name: str = typer.Argument(..., autocompletion=complete_agent_names)) -> None:
     """Stop sharing persistent state/config for an AI CLI in this project."""
     root = project_root()
     ensure_project(root)

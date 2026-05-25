@@ -69,6 +69,11 @@ The default Dockerfile installs common agent CLIs globally:
 - `claude` (`@anthropic-ai/claude-code`)
 - `gemini` (`@google/gemini-cli`)
 
+To refresh these preinstalled tools, run `aim update-container` from outside the
+container. It rebuilds the image, replaces the project container on success, and
+warns first if it detects container-local system changes such as manual `apt`
+installs. Put persistent package installs in `.aim/Dockerfile` instead.
+
 
 ## Shell completion
 
@@ -104,6 +109,8 @@ aim init --force          # overwrite .aim/Dockerfile with current default
 aim run pi                # run a command inside the workspace
 aim run -- pi --help      # use -- before command flags
 aim rebuild
+aim update-container     # refresh image tools; warns about container-local system changes
+aim update-container -y  # skip the warning prompt
 aim reset
 aim clean
 aim clean --all           # remove all aim containers/images; prompts first

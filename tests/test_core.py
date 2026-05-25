@@ -42,6 +42,13 @@ def test_init_creates_project_files_with_agent_tools(workspace: tuple[Path, Path
     assert "@anthropic-ai/claude-code" in dockerfile
     assert "@google/gemini-cli" in dockerfile
     assert "NPM_CONFIG_PREFIX=/home/${USERNAME}/.npm-global" in dockerfile
+    assert "AIM_TOOLS_REFRESH" in dockerfile
+
+
+def test_complete_agent_names() -> None:
+    assert cli.complete_agent_names("") == ["claude", "codex", "gemini", "pi"]
+    assert cli.complete_agent_names("c") == ["claude", "codex"]
+    assert cli.complete_agent_names("x") == []
 
 
 def test_share_agent_is_project_local_and_uses_managed_storage(workspace: tuple[Path, Path]) -> None:
@@ -127,6 +134,20 @@ def test_build_image_skips_when_build_hash_matches(
     assert calls == []
 
 
+def test_ensure_project_migrates_old_tool_install_block(workspace: tuple[Path, Path]) -> None:
+    _home, project = workspace
+    cli.ensure_project(project)
+    dockerfile = project / ".aim" / "Dockerfile"
+    dockerfile.write_text(dockerfile.read_text().replace(
+        'ARG AIM_TOOLS_REFRESH=0\nRUN echo "aim tools refresh: ${AIM_TOOLS_REFRESH}" >/tmp/aim-tools-refresh \\\n  && npm install -g \\\n',
+        'RUN npm install -g \\\n',
+    ))
+
+    cli.ensure_project(project)
+
+    assert "AIM_TOOLS_REFRESH" in dockerfile.read_text()
+
+
 def test_build_image_rebuilds_when_build_hash_differs(
     workspace: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -144,6 +165,62 @@ def test_build_image_rebuilds_when_build_hash_differs(
     assert "--label" in build_args
     assert "aim.managed=1" in build_args
     assert any(arg.startswith("aim.build=") for arg in build_args)
+
+
+def test_build_image_can_refresh_tools_layer(
+    workspace: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _home, project = workspace
+    calls: list[list[str]] = []
+
+    monkeypatch.setattr(cli, "docker", lambda args, **kwargs: calls.append(args))
+
+    cli.build_image(project, force=True, tools_refresh="123")
+
+    build_args = calls[0]
+    assert "--build-arg" in build_args
+    assert "AIM_TOOLS_REFRESH=123" in build_args
+
+
+def test_parse_docker_diff_and_filter_system_changes(
+    workspace: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _home, project = workspace
+    config = {
+        "ignore": {"paths": [".aim"]},
+        "share": {
+            "agents": [],
+            "ssh": {"enabled": False, "host": False, "readonly": False},
+            "dirs": [],
+            "files": [],
+        },
+    }
+
+    class Result:
+        returncode = 0
+        stdout = "C /usr/bin/htop\nA /etc/apt/sources.list.d/foo.list\nA /home/user/note\nA " + str(project / "file") + "\n"
+
+    monkeypatch.setattr(cli, "container_exists", lambda name: True)
+    monkeypatch.setattr(cli, "docker", lambda args, **kwargs: Result())
+
+    changes = cli.container_system_changes(project, config, "user", "container")
+
+    assert changes == [("C", "/usr/bin/htop"), ("A", "/etc/apt/sources.list.d/foo.list")]
+
+
+def test_system_changes_ignores_docker_managed_etc_files(
+    workspace: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _home, project = workspace
+
+    class Result:
+        returncode = 0
+        stdout = "C /etc\nC /etc/hosts\nC /etc/resolv.conf\n"
+
+    monkeypatch.setattr(cli, "container_exists", lambda name: True)
+    monkeypatch.setattr(cli, "docker", lambda args, **kwargs: Result())
+
+    assert cli.container_system_changes(project, {}, "user", "container") == []
 
 
 def test_network_modes(monkeypatch: pytest.MonkeyPatch) -> None:
