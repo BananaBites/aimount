@@ -58,7 +58,7 @@ pipx install git+ssh://git@github.com/BananaBites/aimount.git
 Pinned to a tag/branch:
 
 ```bash
-pip install git+ssh://git@github.com/BananaBites/aimount.git@v0.5.0
+pip install git+ssh://git@github.com/BananaBites/aimount.git@v0.5.1
 ```
 
 Update to the latest version:
@@ -144,6 +144,7 @@ aim init
 aim init --force          # overwrite .aim/Dockerfile with current default
 aim update                # update aim itself when a newer GitHub tag exists
 aim update --check        # check only; exits non-zero if an update exists
+aim status                # show project/config/container status
 aim run pi                # run a command inside the workspace
 aim run -- pi --help      # use -- before command flags
 aim rebuild

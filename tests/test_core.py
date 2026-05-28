@@ -31,6 +31,17 @@ def test_version_option_prints_current_version() -> None:
     assert result.stdout.strip() == cli.current_version()
 
 
+def test_status_reports_project_without_docker(workspace: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch) -> None:
+    _home, project = workspace
+    monkeypatch.setattr(cli, "docker_ok", lambda: False)
+
+    result = CliRunner().invoke(cli.app, ["status"])
+
+    assert result.exit_code == 0
+    assert str(project) in result.stdout
+    assert "docker:         unavailable" in result.stdout
+
+
 def test_init_creates_project_files_with_agent_tools(workspace: tuple[Path, Path]) -> None:
     _home, project = workspace
 

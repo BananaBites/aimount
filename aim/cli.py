@@ -651,6 +651,19 @@ def container_label(name: str, label: str) -> str:
     return out.stdout.strip() if out.returncode == 0 else ""
 
 
+def docker_inspect(name: str) -> dict[str, Any] | None:
+    out = docker(["inspect", name], capture=True, check=False)
+    if out.returncode != 0 or not out.stdout.strip():
+        return None
+    try:
+        data = json.loads(out.stdout)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(data, list) or not data or not isinstance(data[0], dict):
+        return None
+    return data[0]
+
+
 def host_ids() -> tuple[int, int]:
     return (os.getuid() if hasattr(os, "getuid") else 1000, os.getgid() if hasattr(os, "getgid") else 1000)
 
@@ -1300,6 +1313,72 @@ def clean(
 def list_workspaces() -> None:
     """List aim-managed containers."""
     docker(["ps", "-a", "--filter", "label=aim.managed=1", "--format", "table {{.Names}}\t{{.Status}}\t{{.Image}}"])
+
+
+def print_values(title: str, values: list[str]) -> None:
+    console.print(f"{title}:")
+    if values:
+        for value in values:
+            console.print(f"  {escape(value)}")
+    else:
+        console.print("  none")
+
+
+def configured_agents(config: dict[str, Any]) -> list[str]:
+    agents: list[str] = []
+    for item in share_config(config).get("agents", []):
+        if isinstance(item, str):
+            agents.append(f"{item} (managed)")
+        elif isinstance(item, dict) and item.get("name"):
+            agents.append(f"{item.get('name')} ({'host' if item.get('host') else 'managed'})")
+    return agents
+
+
+@app.command()
+def status() -> None:
+    """Show project, config, share, and Docker container status."""
+    root = project_root()
+    cfg_path = project_config_path(root)
+    cfg = load_toml(cfg_path)
+    share = share_config(cfg)
+    name = container_name(root)
+    image = image_name(root)
+
+    console.print(f"project:        {root}")
+    console.print(f"config:         {cfg_path} ({'exists' if cfg_path.exists() else 'missing; run `aim init`'})")
+    console.print(f"config version: {cfg.get('config_version', 'missing')}")
+    console.print(f"image:          {image}")
+    console.print(f"container:      {name}")
+
+    print_values("\nagents", configured_agents(cfg))
+    ssh = share.get("ssh", {})
+    if isinstance(ssh, dict) and ssh.get("enabled"):
+        console.print(f"ssh:            {'host ' if ssh.get('host') else ''}{'ro' if ssh.get('readonly') else 'rw'}")
+    else:
+        console.print("ssh:            disabled")
+    print_values("readonly", readonly_paths(cfg))
+    print_values("readwrite", readwrite_paths(cfg))
+    print_values("hidden", hidden_paths(root, cfg))
+
+    if not docker_ok():
+        console.print("\ndocker:         unavailable")
+        return
+
+    console.print("\ndocker:         available")
+    console.print(f"image exists:   {'yes' if image_exists(image) else 'no'}")
+    info = docker_inspect(name)
+    if not info:
+        console.print("container:      not created")
+        return
+
+    state = info.get("State", {}) if isinstance(info.get("State"), dict) else {}
+    labels = info.get("Config", {}).get("Labels", {}) if isinstance(info.get("Config"), dict) else {}
+    console.print(f"container:      {state.get('Status', 'unknown')}")
+    console.print(f"created:        {info.get('Created', 'unknown')}")
+    if state.get("StartedAt"):
+        console.print(f"started:        {state.get('StartedAt')}")
+    if isinstance(labels, dict) and labels.get("aim.project"):
+        console.print(f"label project:  {labels.get('aim.project')}")
 
 
 def symlink_target(path: Path) -> Path:
