@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+from typer.testing import CliRunner
 
 import aim.cli as cli
 
@@ -23,6 +24,13 @@ def mount_specs(args: list[str]) -> list[str]:
     return [args[i + 1] for i, arg in enumerate(args[:-1]) if arg == "--mount"]
 
 
+def test_version_option_prints_current_version() -> None:
+    result = CliRunner().invoke(cli.app, ["--version"])
+
+    assert result.exit_code == 0
+    assert result.stdout.strip() == cli.current_version()
+
+
 def test_init_creates_project_files_with_agent_tools(workspace: tuple[Path, Path]) -> None:
     _home, project = workspace
 
@@ -33,7 +41,10 @@ def test_init_creates_project_files_with_agent_tools(workspace: tuple[Path, Path
     assert (project / ".aim" / "config.toml").exists()
 
     config = cli.load_toml(project / ".aim" / "config.toml")
-    assert config["ignore"]["paths"] == [".aim", ".env", ".env.local"]
+    assert config["config_version"] == 1
+    assert config["share"]["readonly"] == [".aim"]
+    assert config["share"]["readwrite"] == []
+    assert config["share"]["hidden"] == [".env", ".env.local"]
     assert config["share"]["agents"] == []
 
     dockerfile = (project / ".aim" / "Dockerfile").read_text()
@@ -72,8 +83,8 @@ def test_update_info_uses_cache(workspace: tuple[Path, Path], monkeypatch: pytes
     cli.save_update_cache(
         {
             "checked_at": 9999999999,
-            "current_version": "0.4.1",
-            "latest_tag": "v0.4.2",
+            "current_version": cli.current_version(),
+            "latest_tag": "v0.5.1",
             "update_available": True,
             "repo_url": "https://github.com/BananaBites/aimount.git",
         }
@@ -82,7 +93,7 @@ def test_update_info_uses_cache(workspace: tuple[Path, Path], monkeypatch: pytes
 
     info = cli.get_update_info(force=False)
 
-    assert info["latest_tag"] == "v0.4.2"
+    assert info["latest_tag"] == "v0.5.1"
     assert calls == 0
 
 
@@ -119,6 +130,23 @@ def test_share_agent_can_use_real_host_location(workspace: tuple[Path, Path]) ->
     assert config["share"]["agents"] == [{"name": "pi", "host": True}]
 
 
+def test_share_dir_uses_unified_readonly_and_readwrite_lists(workspace: tuple[Path, Path]) -> None:
+    home, project = workspace
+    downloads = home / "Downloads"
+    downloads.mkdir()
+
+    cli.share_dir(str(downloads), ro=True)
+    cli.share_dir(".aim", ro=True)
+
+    config = cli.load_toml(project / ".aim" / "config.toml")
+    assert config["share"]["readonly"] == [str(downloads), ".aim"]
+    assert config["share"]["readwrite"] == []
+
+    cli.unshare_dir(str(downloads))
+    config = cli.load_toml(project / ".aim" / "config.toml")
+    assert config["share"]["readonly"] == [".aim"]
+
+
 def test_unshare_removes_project_share(workspace: tuple[Path, Path]) -> None:
     _home, project = workspace
 
@@ -129,33 +157,45 @@ def test_unshare_removes_project_share(workspace: tuple[Path, Path]) -> None:
     assert config["share"]["agents"] == []
 
 
-def test_mounts_include_project_masks_and_project_shares(workspace: tuple[Path, Path]) -> None:
+def test_mounts_include_hidden_paths_and_project_shares(workspace: tuple[Path, Path]) -> None:
     home, project = workspace
     (project / ".aim").mkdir()
     (project / ".env").write_text("SECRET=yes")
     (home / ".pi").mkdir()
     downloads = home / "Downloads"
     downloads.mkdir()
+    secret_dir = downloads / "secret"
+    secret_dir.mkdir()
+    cache_dir = downloads / "cache"
+    cache_dir.mkdir()
+    outside_secret = home / "outside-secret"
+    outside_secret.mkdir()
     gitconfig = home / ".gitconfig"
     gitconfig.write_text("[user]\n")
 
     config = {
-        "ignore": {"paths": [".aim", ".env"]},
         "share": {
             "agents": [{"name": "pi", "host": True}],
             "ssh": {"enabled": False, "host": False, "readonly": False},
-            "dirs": [{"path": str(downloads), "readonly": True}],
-            "files": [{"path": str(gitconfig), "target": "~/.gitconfig", "readonly": True}],
+            "readonly": [".aim", str(downloads), "~/.gitconfig"],
+            "readwrite": [str(cache_dir)],
+            "hidden": [".env", str(secret_dir), str(outside_secret)],
         },
     }
 
     specs = mount_specs(cli.all_mounts(project, config, "hannes"))
 
     assert f"type=bind,source={project},target={project}" in specs
-    assert f"type=tmpfs,target={project / '.aim'},tmpfs-size=1048576" in specs
+    assert f"type=bind,source={project / '.aim'},target={project / '.aim'},readonly" in specs
     assert f"type=bind,source=/dev/null,target={project / '.env'},readonly" in specs
     assert f"type=bind,source={home / '.pi'},target=/home/hannes/.pi" in specs
     assert f"type=bind,source={downloads},target={downloads},readonly" in specs
+    assert f"type=tmpfs,target={secret_dir},tmpfs-size=1048576" in specs
+    assert f"type=bind,source={cache_dir},target={cache_dir}" in specs
+    assert not any(str(outside_secret) in spec for spec in specs)
+    assert specs.index(f"type=bind,source={downloads},target={downloads},readonly") < specs.index(
+        f"type=bind,source={cache_dir},target={cache_dir}"
+    )
     assert f"type=bind,source={gitconfig},target=/home/hannes/.gitconfig,readonly" in specs
 
 
@@ -231,12 +271,12 @@ def test_parse_docker_diff_and_filter_system_changes(
 ) -> None:
     _home, project = workspace
     config = {
-        "ignore": {"paths": [".aim"]},
         "share": {
             "agents": [],
             "ssh": {"enabled": False, "host": False, "readonly": False},
-            "dirs": [],
-            "files": [],
+            "readonly": [".aim"],
+            "readwrite": [],
+            "hidden": [],
         },
     }
 
@@ -323,5 +363,6 @@ def test_ensure_container_builds_expected_docker_run_args(
     assert "-p" in run_args
     assert "127.0.0.1:3000:3000" in run_args
     assert f"type=bind,source={project},target={project}" in specs
+    assert f"type=bind,source={project / '.aim'},target={project / '.aim'},readonly" in specs
     assert f"type=bind,source={home / '.aim' / 'share' / 'agents' / 'pi'},target=/home/{cli.user_spec(config)[0]}/.pi" in specs
     assert run_args[-2:] == ["sleep", "infinity"]

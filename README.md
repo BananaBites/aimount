@@ -17,7 +17,8 @@ against malicious code or hostile container workloads.
 
 Important implications:
 
-- The current project is mounted read-write into the container.
+- The current project is mounted read-write into the container, except paths in
+  `[share].readonly` such as `.aim/`.
 - Shared agents, SSH keys, directories, and files can expose credentials or
   private data to tools running in the container.
 - On Linux, the default `network.mode = "auto"` uses host networking for
@@ -57,7 +58,7 @@ pipx install git+ssh://git@github.com/BananaBites/aimount.git
 Pinned to a tag/branch:
 
 ```bash
-pip install git+ssh://git@github.com/BananaBites/aimount.git@v0.4.1
+pip install git+ssh://git@github.com/BananaBites/aimount.git@v0.5.0
 ```
 
 Update to the latest version:
@@ -93,7 +94,8 @@ and prints a short `aim update` reminder if an update is available.
 
 On first run this creates `.aim/Dockerfile` and `.aim/config.toml`,
 builds an Ubuntu-based image, starts/reuses a named container,
-mounts the current project at the same absolute path, and drops you into `bash`.
+mounts the current project at the same absolute path, overlays `[share].readonly`
+paths like `.aim/` read-only, and drops you into `bash`.
 
 The default Dockerfile installs common agent CLIs globally:
 
@@ -137,6 +139,7 @@ grep -R "aim" ~/.bashrc ~/.zshrc ~/.bash_completion ~/.local/share/bash-completi
 
 ```bash
 aim
+aim --version
 aim init
 aim init --force          # overwrite .aim/Dockerfile with current default
 aim update                # update aim itself when a newer GitHub tag exists
@@ -167,7 +170,7 @@ aim share ssh             # ~/.aim/share/ssh -> ~/.ssh
 aim share ssh --host      # ~/.ssh -> ~/.ssh
 
 aim share dir ~/Downloads --ro
-aim share file ~/.gitconfig --target ~/.gitconfig --ro
+aim share file ~/.gitconfig --ro
 
 aim expose port 3000
 aim network off
@@ -201,8 +204,17 @@ aim run -- pi --help
 - `aim share agent pi` mounts `~/.aim/share/agents/pi` as `~/.pi` in the container.
 - `aim share agent pi --host` mounts your real host `~/.pi` as `~/.pi` in the container.
 - `share ssh` shares SSH identity/config as `~/.ssh`.
-- `share dir` and `share file` share real host paths.
+- `share dir` and `share file` add paths to `[share].readwrite` by default or
+  `[share].readonly` with `--ro`.
 - `--host` means use the real host location instead of aim-managed storage.
+- The project root itself is always mounted read-write.
+- Relative share paths are resolved inside the project; absolute paths use the
+  same host/container path.
+- More specific paths override broader mounts, so `[share].readwrite` can re-open
+  a subpath of `[share].readonly`.
+- `[share].readonly` paths stay visible but read-only; `.aim` is readonly by default.
+- `[share].hidden` only has an effect inside an already mounted path; `.env` and
+  `.env.local` are hidden by default.
 
 Config/state lives in:
 

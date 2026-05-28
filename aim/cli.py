@@ -41,10 +41,12 @@ PACKAGE_NAME = "aimount"
 DEFAULT_REPO_URL = "https://github.com/BananaBites/aimount.git"
 UPDATE_CHECK_INTERVAL = 24 * 60 * 60
 UPDATE_CHECK_TIMEOUT = 2.0
+CONFIG_VERSION = 1
 GLOBAL_DIR = Path.home() / ".aim"
 PROJECT_DIRNAME = ".aim"
 DEFAULT_PORTS = [3000, 5173, 8000, 8080]
-DEFAULT_IGNORES = [".aim", ".env", ".env.local"]
+DEFAULT_HIDDEN = [".env", ".env.local"]
+DEFAULT_READONLY = [".aim"]
 AGENT_DIRS = {
     "pi": ".pi",
     "codex": ".codex",
@@ -124,13 +126,11 @@ CMD ["bash"]
 """
 
 PROJECT_CONFIG = """# Project-local aim config. Safe to commit/share.
+config_version = 1
 
 [network]
 mode = "auto"   # auto, host, bridge, off
 ports = [3000, 5173, 8000, 8080]
-
-[ignore]
-paths = [".aim", ".env", ".env.local"]
 
 # Optional: override the container user.
 # By default aim mirrors your host username and UID/GID so files stay editable.
@@ -142,8 +142,17 @@ paths = [".aim", ".env", ".env.local"]
 [share]
 agents = []
 ssh = { enabled = false, host = false, readonly = false }
-dirs = []
-files = []
+# Hints:
+# - The project root itself is always mounted read-write.
+# - Relative paths are resolved inside the project; absolute paths use the same host/container path.
+# - More specific paths override broader mounts, so readwrite can re-open a subpath of readonly.
+# - hidden only has an effect inside an already mounted path.
+# Mounted read-only.
+readonly = [".aim"]
+# Mounted read-write. Absolute paths can add extra host paths; the project root is already read-write.
+readwrite = []
+# Hidden in the container by default to avoid exposing local secrets.
+hidden = [".env", ".env.local"]
 """
 
 GLOBAL_CONFIG = """# User-local aim config. Reserved for future personal defaults.
@@ -566,6 +575,7 @@ def write_toml(path: Path, data: dict[str, Any], header: str = "") -> None:
 
 
 def save_project(root: Path, data: dict[str, Any]) -> None:
+    data.setdefault("config_version", CONFIG_VERSION)
     write_toml(project_config_path(root), data, "# Project-local aim config. Safe to commit/share.")
 
 
@@ -747,14 +757,7 @@ def container_path(path: str, username: str) -> str:
     return path
 
 
-def ignore_paths(root: Path, config: dict[str, Any]) -> list[str]:
-    paths = list(config.get("ignore", {}).get("paths", DEFAULT_IGNORES))
-    aimignore = root / ".aimignore"
-    if aimignore.exists():
-        for line in aimignore.read_text().splitlines():
-            line = line.strip()
-            if line and not line.startswith("#"):
-                paths.append(line)
+def clean_project_paths(paths: list[Any]) -> list[str]:
     seen: set[str] = set()
     clean: list[str] = []
     for p in paths:
@@ -768,6 +771,25 @@ def ignore_paths(root: Path, config: dict[str, Any]) -> list[str]:
     return clean
 
 
+def clean_share_paths(paths: list[Any]) -> list[str]:
+    seen: set[str] = set()
+    clean: list[str] = []
+    for p in paths:
+        p = str(p).strip()
+        if not p:
+            continue
+        if any(ch in p for ch in "*?["):
+            continue
+        if not (p == "~" or p.startswith("~/") or Path(p).is_absolute()):
+            p = p.strip("/")
+            if ".." in Path(p).parts:
+                continue
+        if p not in seen:
+            seen.add(p)
+            clean.append(p)
+    return clean
+
+
 def complete_agent_names(incomplete: str = "") -> list[str]:
     return [name for name in sorted(AGENT_DIRS) if name.startswith(incomplete)]
 
@@ -776,31 +798,84 @@ def share_config(config: dict[str, Any]) -> dict[str, Any]:
     share = config.setdefault("share", {})
     share.setdefault("agents", [])
     share.setdefault("ssh", {"enabled": False, "host": False, "readonly": False})
-    share.setdefault("dirs", [])
-    share.setdefault("files", [])
+    share.setdefault("readonly", list(DEFAULT_READONLY))
+    share.setdefault("readwrite", [])
+    share.setdefault("hidden", list(DEFAULT_HIDDEN))
     return share
 
 
-def all_mounts(root: Path, config: dict[str, Any], username: str) -> list[str]:
-    args: list[str] = []
-    args += mount_arg(root, str(root))
+def hidden_paths(root: Path, config: dict[str, Any]) -> list[str]:
+    paths = list(share_config(config).get("hidden", DEFAULT_HIDDEN))
+    aimignore = root / ".aimignore"
+    if aimignore.exists():
+        for line in aimignore.read_text().splitlines():
+            line = line.strip()
+            if line and not line.startswith("#"):
+                paths.append(line)
+    return clean_share_paths(paths)
 
-    for p in ignore_paths(root, config):
-        host_path = root / p
-        target = str(root / p)
-        if host_path.is_dir():
-            args += mount_arg("", target, kind="tmpfs")
-        elif host_path.is_file():
-            args += mount_arg("/dev/null", target, readonly=True)
 
+def readonly_paths(config: dict[str, Any]) -> list[str]:
+    return clean_share_paths(list(share_config(config).get("readonly", DEFAULT_READONLY)))
+
+
+def readwrite_paths(config: dict[str, Any]) -> list[str]:
+    return clean_share_paths(list(share_config(config).get("readwrite", [])))
+
+
+def share_source_target(root: Path, path: str, username: str) -> tuple[Path, str]:
+    if path == "~" or path.startswith("~/"):
+        return Path(path).expanduser().resolve(), container_path(path, username)
+    if Path(path).is_absolute():
+        source = Path(path).expanduser().resolve()
+        return source, str(source)
+    source = (root / path).resolve()
+    return source, str(root / path)
+
+
+def config_share_path(path: str) -> str | None:
+    path = str(path).strip()
+    if not path or any(ch in path for ch in "*?["):
+        return None
+    if path == "~" or path.startswith("~/"):
+        return path
+    if Path(path).expanduser().is_absolute():
+        return str(Path(path).expanduser().resolve())
+    path = path.strip("/")
+    if not path or ".." in Path(path).parts:
+        return None
+    return path
+
+
+def add_shared_path(share: dict[str, Any], path: str, *, readonly: bool) -> None:
+    key = "readonly" if readonly else "readwrite"
+    other = "readwrite" if readonly else "readonly"
+    share[other] = [p for p in clean_share_paths(list(share.get(other, []))) if p != path]
+    paths = [p for p in clean_share_paths(list(share.get(key, []))) if p != path]
+    paths.append(path)
+    share[key] = paths
+
+
+def remove_shared_path(share: dict[str, Any], path: str) -> bool:
+    removed = False
+    for key in ("readonly", "readwrite"):
+        before = clean_share_paths(list(share.get(key, [])))
+        after = [p for p in before if p != path]
+        share[key] = after
+        removed = removed or len(after) != len(before)
+    return removed
+
+
+def base_share_mounts(config: dict[str, Any], username: str) -> list[tuple[Path, str, bool]]:
     share = share_config(config)
+    mounts: list[tuple[Path, str, bool]] = []
     home = f"/home/{username}"
 
     ssh = share.get("ssh", {})
     if isinstance(ssh, dict) and ssh.get("enabled"):
         src = Path.home() / ".ssh" if ssh.get("host") else GLOBAL_DIR / "share" / "ssh"
         src.mkdir(parents=True, exist_ok=True)
-        args += mount_arg(src, f"{home}/.ssh", readonly=bool(ssh.get("readonly", False)))
+        mounts.append((src, f"{home}/.ssh", bool(ssh.get("readonly", False))))
 
     for item in share.get("agents", []):
         if isinstance(item, str):
@@ -811,53 +886,74 @@ def all_mounts(root: Path, config: dict[str, Any], username: str) -> list[str]:
         target_dir = AGENT_DIRS.get(name, f".{name}")
         src = Path.home() / target_dir if item.get("host") else GLOBAL_DIR / "share" / "agents" / name
         src.mkdir(parents=True, exist_ok=True)
-        args += mount_arg(src, f"{home}/{target_dir}")
+        mounts.append((src, f"{home}/{target_dir}", False))
 
-    for item in share.get("dirs", []):
-        if not isinstance(item, dict) or "path" not in item:
-            continue
-        src = Path(str(item["path"])).expanduser().resolve()
-        if not src.is_dir():
-            console.print(f"[yellow]skipping missing shared dir[/] {src}")
-            continue
-        target = str(item.get("target") or src)
-        args += mount_arg(src, container_path(target, username), readonly=bool(item.get("readonly", False)))
+    return mounts
 
-    for item in share.get("files", []):
-        if not isinstance(item, dict) or "path" not in item:
+
+def target_depth(target: str) -> int:
+    return len(Path(target).parts)
+
+
+def mounted_targets(root: Path, config: dict[str, Any], username: str) -> list[str]:
+    targets = [str(root)]
+    targets += [target for _src, target, _ro in base_share_mounts(config, username)]
+    for p in readonly_paths(config) + readwrite_paths(config):
+        src, target = share_source_target(root, p, username)
+        if src.exists():
+            targets.append(target)
+    return targets
+
+
+def all_mounts(root: Path, config: dict[str, Any], username: str) -> list[str]:
+    args: list[str] = []
+    args += mount_arg(root, str(root))
+
+    for src, target, readonly in sorted(base_share_mounts(config, username), key=lambda item: target_depth(item[1])):
+        args += mount_arg(src, target, readonly=readonly)
+
+    mounted = mounted_targets(root, config, username)
+    rules: list[tuple[str, int, Path | str, str, bool]] = []
+
+    for p in readonly_paths(config):
+        src, target = share_source_target(root, p, username)
+        if not src.exists():
+            console.print(f"[yellow]skipping missing shared path[/] {src}")
             continue
-        src = Path(str(item["path"])).expanduser().resolve()
-        if not src.is_file():
-            console.print(f"[yellow]skipping missing shared file[/] {src}")
+        rules.append((target, 0, src, target, True))
+
+    for p in hidden_paths(root, config):
+        src, target = share_source_target(root, p, username)
+        if not any(path_is_under(target, mounted_target) for mounted_target in mounted):
             continue
-        target = str(item.get("target") or src)
-        args += mount_arg(src, container_path(target, username), readonly=bool(item.get("readonly", False)))
+        if src.is_dir():
+            rules.append((target, 1, "", target, False))
+        elif src.is_file():
+            rules.append((target, 1, "/dev/null", target, True))
+
+    for p in readwrite_paths(config):
+        src, target = share_source_target(root, p, username)
+        if not src.exists():
+            console.print(f"[yellow]skipping missing shared path[/] {src}")
+            continue
+        rules.append((target, 2, src, target, False))
+
+    for _target, _precedence, src, target, readonly in sorted(rules, key=lambda item: (target_depth(item[0]), item[1])):
+        if src == "":
+            args += mount_arg(src, target, kind="tmpfs")
+        else:
+            args += mount_arg(src, target, readonly=readonly)
 
     return args
 
 
 def configured_mount_targets(root: Path, config: dict[str, Any], username: str) -> list[str]:
-    targets = [str(root)]
-    targets += [str(root / p) for p in ignore_paths(root, config)]
-
-    share = share_config(config)
-    home = f"/home/{username}"
-    ssh = share.get("ssh", {})
-    if isinstance(ssh, dict) and ssh.get("enabled"):
-        targets.append(f"{home}/.ssh")
-
-    for item in share.get("agents", []):
-        if isinstance(item, str):
-            item = {"name": item, "host": False}
-        if isinstance(item, dict) and "name" in item:
-            target_dir = AGENT_DIRS.get(str(item["name"]), f".{item['name']}")
-            targets.append(f"{home}/{target_dir}")
-
-    for key in ("dirs", "files"):
-        for item in share.get(key, []):
-            if isinstance(item, dict) and "path" in item:
-                target = str(item.get("target") or Path(str(item["path"])).expanduser().resolve())
-                targets.append(container_path(target, username))
+    targets = mounted_targets(root, config, username)
+    mounted = list(targets)
+    for p in hidden_paths(root, config):
+        src, target = share_source_target(root, p, username)
+        if src.exists() and any(path_is_under(target, mounted_target) for mounted_target in mounted):
+            targets.append(target)
 
     seen: set[str] = set()
     clean: list[str] = []
@@ -1028,8 +1124,23 @@ def launch() -> None:
     enter_shell(root)
 
 
+def print_version(value: bool) -> None:
+    if value:
+        console.print(current_version())
+        raise typer.Exit()
+
+
 @app.callback()
-def main(ctx: typer.Context) -> None:
+def main(
+    ctx: typer.Context,
+    version: bool = typer.Option(
+        False,
+        "--version",
+        callback=print_version,
+        is_eager=True,
+        help="Show the aim version and exit.",
+    ),
+) -> None:
     if ctx.invoked_subcommand is None:
         launch()
 
@@ -1229,12 +1340,8 @@ def doctor_share_warnings(config: dict[str, Any]) -> list[str]:
     ssh = share.get("ssh", {})
     if isinstance(ssh, dict) and ssh.get("enabled"):
         warnings.append("ssh is shared with the container" + (" from real ~/.ssh" if ssh.get("host") else ""))
-    for item in share.get("dirs", []):
-        if isinstance(item, dict) and not item.get("readonly", False):
-            warnings.append(f"directory is shared read-write: {item.get('path')}")
-    for item in share.get("files", []):
-        if isinstance(item, dict) and not item.get("readonly", False):
-            warnings.append(f"file is shared read-write: {item.get('path')}")
+    for path in readwrite_paths(config):
+        warnings.append(f"path is shared read-write: {path}")
     return warnings
 
 
@@ -1304,21 +1411,27 @@ def print_shares(path: Path, cfg: dict[str, Any]) -> None:
     else:
         console.print("  none")
 
-    console.print("\n[bold]dirs[/]")
-    dirs = share.get("dirs", [])
-    if dirs:
-        for item in dirs:
-            if isinstance(item, dict):
-                console.print(f"  {item.get('path')} -> {item.get('target') or item.get('path')} ({'ro' if item.get('readonly') else 'rw'})")
+    console.print("\n[bold]readonly[/]")
+    readonly = readonly_paths(cfg)
+    if readonly:
+        for path in readonly:
+            console.print(f"  {path}")
     else:
         console.print("  none")
 
-    console.print("\n[bold]files[/]")
-    files = share.get("files", [])
-    if files:
-        for item in files:
-            if isinstance(item, dict):
-                console.print(f"  {item.get('path')} -> {item.get('target') or item.get('path')} ({'ro' if item.get('readonly') else 'rw'})")
+    console.print("\n[bold]readwrite[/]")
+    readwrite = readwrite_paths(cfg)
+    if readwrite:
+        for path in readwrite:
+            console.print(f"  {path}")
+    else:
+        console.print("  none")
+
+    console.print("\n[bold]hidden[/]")
+    hidden = hidden_paths(path.parent.parent, cfg) if path.name == "config.toml" else clean_project_paths(list(share.get("hidden", [])))
+    if hidden:
+        for item in hidden:
+            console.print(f"  {item}")
     else:
         console.print("  none")
 
@@ -1373,53 +1486,49 @@ def share_ssh(
 @share_app.command("dir")
 def share_dir(
     path: str,
-    target: str | None = typer.Option(None, "--target", "-t", help="Container target path. Defaults to the same absolute path."),
     ro: bool = typer.Option(False, "--ro/--rw", help="Mount read-only/read-write."),
 ) -> None:
-    """Share a real host directory with this project's container."""
+    """Share a directory path with this project's container."""
     ensure_global()
     root = project_root()
     ensure_project(root)
-    src = Path(path).expanduser().resolve()
+    item = config_share_path(path)
+    if item is None:
+        console.print(f"[red]invalid path:[/] {path}")
+        raise typer.Exit(1)
+    src, target = share_source_target(root, item, getpass.getuser())
     if not src.is_dir():
         console.print(f"[red]not a directory:[/] {src}")
         raise typer.Exit(1)
     cfg = load_toml(project_config_path(root))
     share = share_config(cfg)
-    dirs = [d for d in share.get("dirs", []) if not (isinstance(d, dict) and d.get("path") == str(src))]
-    item: dict[str, Any] = {"path": str(src), "readonly": bool(ro)}
-    if target:
-        item["target"] = target
-    dirs.append(item)
-    share["dirs"] = dirs
+    add_shared_path(share, item, readonly=bool(ro))
     save_project(root, cfg)
-    console.print(f"[green]shared dir[/] {src} -> {target or src} ({'ro' if ro else 'rw'})")
+    console.print(f"[green]shared dir[/] {item} -> {target} ({'ro' if ro else 'rw'})")
 
 
 @share_app.command("file")
 def share_file(
     path: str,
-    target: str | None = typer.Option(None, "--target", "-t", help="Container target path. Defaults to the same absolute path."),
     ro: bool = typer.Option(False, "--ro/--rw", help="Mount read-only/read-write."),
 ) -> None:
-    """Share a real host file with this project's container."""
+    """Share a file path with this project's container."""
     ensure_global()
     root = project_root()
     ensure_project(root)
-    src = Path(path).expanduser().resolve()
+    item = config_share_path(path)
+    if item is None:
+        console.print(f"[red]invalid path:[/] {path}")
+        raise typer.Exit(1)
+    src, target = share_source_target(root, item, getpass.getuser())
     if not src.is_file():
         console.print(f"[red]not a file:[/] {src}")
         raise typer.Exit(1)
     cfg = load_toml(project_config_path(root))
     share = share_config(cfg)
-    files = [f for f in share.get("files", []) if not (isinstance(f, dict) and f.get("path") == str(src))]
-    item: dict[str, Any] = {"path": str(src), "readonly": bool(ro)}
-    if target:
-        item["target"] = target
-    files.append(item)
-    share["files"] = files
+    add_shared_path(share, item, readonly=bool(ro))
     save_project(root, cfg)
-    console.print(f"[green]shared file[/] {src} -> {target or src} ({'ro' if ro else 'rw'})")
+    console.print(f"[green]shared file[/] {item} -> {target} ({'ro' if ro else 'rw'})")
 
 
 @unshare_app.command("agent")
@@ -1449,30 +1558,34 @@ def unshare_ssh() -> None:
 
 @unshare_app.command("dir")
 def unshare_dir(path: str) -> None:
-    """Stop sharing a host directory in this project."""
+    """Stop sharing a directory path in this project."""
     root = project_root()
     ensure_project(root)
-    src = str(Path(path).expanduser().resolve())
+    item = config_share_path(path)
+    if item is None:
+        console.print(f"[red]invalid path:[/] {path}")
+        raise typer.Exit(1)
     cfg = load_toml(project_config_path(root))
     share = share_config(cfg)
-    before = len(share.get("dirs", []))
-    share["dirs"] = [d for d in share.get("dirs", []) if not (isinstance(d, dict) and d.get("path") == src)]
+    removed = remove_shared_path(share, item)
     save_project(root, cfg)
-    console.print(f"[green]unshared dir[/] {src}" if len(share["dirs"]) != before else f"[yellow]dir was not shared[/] {src}")
+    console.print(f"[green]unshared dir[/] {item}" if removed else f"[yellow]dir was not shared[/] {item}")
 
 
 @unshare_app.command("file")
 def unshare_file(path: str) -> None:
-    """Stop sharing a host file in this project."""
+    """Stop sharing a file path in this project."""
     root = project_root()
     ensure_project(root)
-    src = str(Path(path).expanduser().resolve())
+    item = config_share_path(path)
+    if item is None:
+        console.print(f"[red]invalid path:[/] {path}")
+        raise typer.Exit(1)
     cfg = load_toml(project_config_path(root))
     share = share_config(cfg)
-    before = len(share.get("files", []))
-    share["files"] = [f for f in share.get("files", []) if not (isinstance(f, dict) and f.get("path") == src)]
+    removed = remove_shared_path(share, item)
     save_project(root, cfg)
-    console.print(f"[green]unshared file[/] {src}" if len(share["files"]) != before else f"[yellow]file was not shared[/] {src}")
+    console.print(f"[green]unshared file[/] {item}" if removed else f"[yellow]file was not shared[/] {item}")
 
 
 @expose_app.command("port")
