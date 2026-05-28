@@ -63,9 +63,20 @@ pip install git+ssh://git@github.com/BananaBites/aimount.git@v0.4.1
 Update to the latest version:
 
 ```bash
-pip install --upgrade --force-reinstall git+ssh://git@github.com/BananaBites/aimount.git
+aim update
+```
+
+`aim update` checks GitHub version tags and reinstalls the newest tag using the
+same Python package manager style it detects for the current install: `pipx` when
+AiMount is running from a pipx venv, otherwise `python -m pip`. It reuses the
+installed Git URL/transport where possible, so SSH installs keep using SSH.
+
+Manual equivalent:
+
+```bash
+pip install --upgrade --force-reinstall git+ssh://git@github.com/BananaBites/aimount.git@TAG
 # or, for pipx
-pipx install --force git+ssh://git@github.com/BananaBites/aimount.git
+pipx install --force git+ssh://git@github.com/BananaBites/aimount.git@TAG
 ```
 
 
@@ -76,6 +87,9 @@ From a project directory:
 ```bash
 aim
 ```
+
+When starting, `aim` checks for newer GitHub version tags at most once per day
+and prints a short `aim update` reminder if an update is available.
 
 On first run this creates `.aim/Dockerfile` and `.aim/config.toml`,
 builds an Ubuntu-based image, starts/reuses a named container,
@@ -125,6 +139,8 @@ grep -R "aim" ~/.bashrc ~/.zshrc ~/.bash_completion ~/.local/share/bash-completi
 aim
 aim init
 aim init --force          # overwrite .aim/Dockerfile with current default
+aim update                # update aim itself when a newer GitHub tag exists
+aim update --check        # check only; exits non-zero if an update exists
 aim run pi                # run a command inside the workspace
 aim run -- pi --help      # use -- before command flags
 aim rebuild

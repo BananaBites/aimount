@@ -2,15 +2,19 @@ from __future__ import annotations
 
 import getpass
 import hashlib
+import importlib.metadata
 import json
 import os
 import platform
 import re
+import shlex
 import shutil
 import subprocess
 import sys
 import time
 import tomllib
+import urllib.parse
+import urllib.request
 from pathlib import Path
 from typing import Any
 
@@ -33,6 +37,10 @@ app.add_typer(expose_app, name="expose")
 app.add_typer(network_app, name="network")
 console = Console()
 
+PACKAGE_NAME = "aimount"
+DEFAULT_REPO_URL = "https://github.com/BananaBites/aimount.git"
+UPDATE_CHECK_INTERVAL = 24 * 60 * 60
+UPDATE_CHECK_TIMEOUT = 2.0
 GLOBAL_DIR = Path.home() / ".aim"
 PROJECT_DIRNAME = ".aim"
 DEFAULT_PORTS = [3000, 5173, 8000, 8080]
@@ -244,6 +252,254 @@ def ensure_global() -> None:
     cfg = global_config_path()
     if not cfg.exists():
         cfg.write_text(GLOBAL_CONFIG)
+
+
+def update_cache_path() -> Path:
+    return GLOBAL_DIR / "update-check.json"
+
+
+def current_version() -> str:
+    # When running from a checkout, pyproject.toml is the source of truth and can
+    # be newer than stale local egg-info metadata. Installed packages normally do
+    # not include pyproject.toml, so fall back to package metadata there.
+    pyproject = Path(__file__).resolve().parents[1] / "pyproject.toml"
+    if pyproject.exists():
+        try:
+            return str(load_toml(pyproject).get("project", {}).get("version") or "0.0.0")
+        except Exception:
+            pass
+    try:
+        return importlib.metadata.version(PACKAGE_NAME)
+    except importlib.metadata.PackageNotFoundError:
+        return "0.0.0"
+
+
+def parse_version(value: str) -> tuple[int, int, int] | None:
+    match = re.fullmatch(r"v?(\d+)\.(\d+)\.(\d+)", value.strip())
+    if not match:
+        return None
+    return tuple(int(part) for part in match.groups())  # type: ignore[return-value]
+
+
+def is_newer_version(candidate: str, current: str) -> bool:
+    candidate_version = parse_version(candidate)
+    current_version_tuple = parse_version(current)
+    return bool(candidate_version and current_version_tuple and candidate_version > current_version_tuple)
+
+
+def direct_url_metadata() -> dict[str, Any]:
+    try:
+        dist = importlib.metadata.distribution(PACKAGE_NAME)
+        text = dist.read_text("direct_url.json")
+    except importlib.metadata.PackageNotFoundError:
+        return {}
+    if not text:
+        return {}
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def file_url_to_path(url: str) -> Path | None:
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme != "file":
+        return None
+    return Path(urllib.request.url2pathname(parsed.path)).resolve(strict=False)
+
+
+def git_origin(path: Path) -> str | None:
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(path), "config", "--get", "remote.origin.url"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+        )
+    except FileNotFoundError:
+        return None
+    origin = proc.stdout.strip()
+    return origin if proc.returncode == 0 and origin else None
+
+
+def installed_repo_url() -> str:
+    direct = direct_url_metadata()
+    if direct.get("vcs_info", {}).get("vcs") == "git" and direct.get("url"):
+        return str(direct["url"])
+
+    if direct.get("url"):
+        local_path = file_url_to_path(str(direct["url"]))
+        if local_path:
+            origin = git_origin(local_path)
+            if origin:
+                return origin
+
+    source_root = Path(__file__).resolve().parents[1]
+    origin = git_origin(source_root)
+    return origin or DEFAULT_REPO_URL
+
+
+def github_repo_slug(repo_url: str) -> str | None:
+    url = repo_url.removeprefix("git+").removesuffix(".git")
+    match = re.search(r"github\.com[:/]([^/]+)/([^/#?]+)$", url)
+    if not match:
+        return None
+    return f"{match.group(1)}/{match.group(2)}"
+
+
+def latest_tag_from_github_api(repo_url: str, *, timeout: float) -> str | None:
+    slug = github_repo_slug(repo_url)
+    if not slug:
+        return None
+    request = urllib.request.Request(
+        f"https://api.github.com/repos/{slug}/tags?per_page=100",
+        headers={"Accept": "application/vnd.github+json", "User-Agent": f"{PACKAGE_NAME}-update-check"},
+    )
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        payload = json.loads(response.read().decode("utf-8"))
+    tags = [item.get("name") for item in payload if isinstance(item, dict)]
+    return newest_tag(tag for tag in tags if isinstance(tag, str))
+
+
+def newest_tag(tags: Any) -> str | None:
+    parsed: list[tuple[tuple[int, int, int], str]] = []
+    for tag in tags:
+        version = parse_version(str(tag))
+        if version:
+            parsed.append((version, str(tag)))
+    if not parsed:
+        return None
+    return max(parsed, key=lambda item: item[0])[1]
+
+
+def latest_tag_from_git(repo_url: str, *, timeout: float) -> str | None:
+    proc = subprocess.run(
+        ["git", "ls-remote", "--tags", "--refs", repo_url],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=timeout,
+        check=False,
+        env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(proc.stderr.strip() or "git ls-remote failed")
+    tags = []
+    for line in proc.stdout.splitlines():
+        _sha, _sep, ref = line.partition("\t")
+        if ref.startswith("refs/tags/"):
+            tags.append(ref.removeprefix("refs/tags/"))
+    return newest_tag(tags)
+
+
+def latest_available_tag(repo_url: str, *, timeout: float = UPDATE_CHECK_TIMEOUT) -> str | None:
+    try:
+        return latest_tag_from_git(repo_url, timeout=timeout)
+    except (FileNotFoundError, RuntimeError, subprocess.TimeoutExpired):
+        return latest_tag_from_github_api(repo_url, timeout=timeout)
+
+
+def load_update_cache() -> dict[str, Any]:
+    path = update_cache_path()
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def save_update_cache(data: dict[str, Any]) -> None:
+    try:
+        ensure_global()
+        update_cache_path().write_text(json.dumps(data, indent=2, sort_keys=True) + "\n")
+    except OSError:
+        pass
+
+
+def get_update_info(*, force: bool = False, timeout: float = UPDATE_CHECK_TIMEOUT) -> dict[str, Any]:
+    now = time.time()
+    current = current_version()
+    cache = load_update_cache()
+    try:
+        checked_at = float(cache.get("checked_at", 0))
+    except (TypeError, ValueError):
+        checked_at = 0
+    if (
+        not force
+        and checked_at
+        and now - checked_at < UPDATE_CHECK_INTERVAL
+        and cache.get("current_version") == current
+    ):
+        return cache
+
+    repo_url = installed_repo_url()
+    info: dict[str, Any] = {"checked_at": now, "current_version": current, "repo_url": repo_url}
+    try:
+        tag = latest_available_tag(repo_url, timeout=timeout)
+        if tag:
+            info["latest_tag"] = tag
+            info["latest_version"] = tag.lstrip("v")
+            info["update_available"] = is_newer_version(tag, str(info["current_version"]))
+        else:
+            info["error"] = "no version tags found"
+            info["update_available"] = False
+    except Exception as exc:
+        info["error"] = str(exc) or exc.__class__.__name__
+        info["update_available"] = False
+    save_update_cache(info)
+    return info
+
+
+def pip_git_url(repo_url: str) -> str:
+    url = repo_url.removeprefix("git+")
+    match = re.fullmatch(r"([^@\s]+@[^:\s]+):(.+)", url)
+    if match:
+        return f"ssh://{match.group(1)}/{match.group(2)}"
+    return url
+
+
+def git_install_spec(repo_url: str, tag: str | None = None) -> str:
+    spec = "git+" + pip_git_url(repo_url)
+    if tag:
+        spec += f"@{tag}"
+    return spec
+
+
+def pipx_package_name() -> str | None:
+    metadata_path = Path(sys.prefix) / "pipx_metadata.json"
+    if not metadata_path.exists():
+        return None
+    try:
+        data = json.loads(metadata_path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+    main_package = data.get("main_package", {}) if isinstance(data, dict) else {}
+    package = str(main_package.get("package") or "")
+    return package if package == PACKAGE_NAME else None
+
+
+def update_install_command(repo_url: str, tag: str) -> list[str]:
+    spec = git_install_spec(repo_url, tag)
+    pipx_package = pipx_package_name()
+    if pipx_package and shutil.which("pipx"):
+        return ["pipx", "install", "--force", spec]
+    return [sys.executable, "-m", "pip", "install", "--upgrade", "--force-reinstall", spec]
+
+
+def maybe_print_update_notice() -> None:
+    info = get_update_info(force=False, timeout=UPDATE_CHECK_TIMEOUT)
+    if not info.get("update_available"):
+        return
+    current = info.get("current_version", "unknown")
+    latest = info.get("latest_tag") or info.get("latest_version")
+    console.print(
+        f"[yellow]Hey, there is a newer aim version available ({current} → {latest}). "
+        "Do an `aim update` please.[/]"
+    )
 
 
 def ensure_project(root: Path, *, force: bool = False) -> None:
@@ -763,6 +1019,7 @@ def enter_shell(root: Path) -> None:
 
 
 def launch() -> None:
+    maybe_print_update_notice()
     if not docker_ok():
         console.print("[red]Docker is not available or the daemon is not running.[/]")
         raise typer.Exit(1)
@@ -783,6 +1040,38 @@ def init(force: bool = typer.Option(False, "--force", help="Overwrite .aim/Docke
     ensure_global()
     ensure_project(project_root(), force=force)
     console.print("[green]aim initialized[/]")
+
+
+@app.command()
+def update(
+    check: bool = typer.Option(False, "--check", help="Only check whether an update is available."),
+) -> None:
+    """Check for and install a newer aim release from GitHub."""
+    info = get_update_info(force=True, timeout=10.0)
+    current = str(info.get("current_version", "unknown"))
+    repo_url = str(info.get("repo_url", DEFAULT_REPO_URL))
+
+    if info.get("error"):
+        console.print(f"[red]could not check for updates:[/] {escape(str(info['error']))}")
+        raise typer.Exit(1)
+
+    latest_tag = str(info.get("latest_tag") or "")
+    if not latest_tag:
+        console.print("[yellow]no version tags found[/]")
+        raise typer.Exit(1)
+
+    if not info.get("update_available"):
+        console.print(f"[green]aim is up to date[/] ({current}, latest {latest_tag})")
+        return
+
+    console.print(f"[yellow]new aim version available:[/] {current} → {latest_tag}")
+    if check:
+        raise typer.Exit(1)
+
+    command = update_install_command(repo_url, latest_tag)
+    console.print("[cyan]update command:[/] " + " ".join(shlex.quote(arg) for arg in command))
+    run_process(command)
+    console.print("[green]aim updated[/] Restart `aim` to use the new version.")
 
 
 @app.command(context_settings={"allow_extra_args": True, "ignore_unknown_options": True})

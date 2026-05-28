@@ -51,6 +51,50 @@ def test_complete_agent_names() -> None:
     assert cli.complete_agent_names("x") == []
 
 
+def test_update_version_helpers() -> None:
+    assert cli.newest_tag(["v0.4.1", "v0.10.0", "not-a-version"]) == "v0.10.0"
+    assert cli.is_newer_version("v0.4.2", "0.4.1")
+    assert not cli.is_newer_version("v0.4.1", "0.4.1")
+    assert cli.git_install_spec("git@github.com:BananaBites/aimount.git", "v0.4.2") == (
+        "git+ssh://git@github.com/BananaBites/aimount.git@v0.4.2"
+    )
+
+
+def test_update_info_uses_cache(workspace: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch) -> None:
+    _home, _project = workspace
+    calls = 0
+
+    def fail_if_called(repo_url: str, *, timeout: float) -> str | None:
+        nonlocal calls
+        calls += 1
+        raise AssertionError("network should not be used with fresh cache")
+
+    cli.save_update_cache(
+        {
+            "checked_at": 9999999999,
+            "current_version": "0.4.1",
+            "latest_tag": "v0.4.2",
+            "update_available": True,
+            "repo_url": "https://github.com/BananaBites/aimount.git",
+        }
+    )
+    monkeypatch.setattr(cli, "latest_available_tag", fail_if_called)
+
+    info = cli.get_update_info(force=False)
+
+    assert info["latest_tag"] == "v0.4.2"
+    assert calls == 0
+
+
+def test_update_install_command_uses_pip_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(cli, "pipx_package_name", lambda: None)
+
+    command = cli.update_install_command("https://github.com/BananaBites/aimount.git", "v0.4.2")
+
+    assert command[:4] == [cli.sys.executable, "-m", "pip", "install"]
+    assert command[-1] == "git+https://github.com/BananaBites/aimount.git@v0.4.2"
+
+
 def test_share_agent_is_project_local_and_uses_managed_storage(workspace: tuple[Path, Path]) -> None:
     home, project = workspace
 
