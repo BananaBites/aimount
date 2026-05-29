@@ -1236,7 +1236,7 @@ def print_container_update_warning(changes: list[tuple[str, str]], *, limit: int
 
 @app.command()
 def rebuild(no_cache: bool = typer.Option(False, "--no-cache", help="Disable Docker build cache.")) -> None:
-    """Rebuild the project image and recreate the workspace container."""
+    """Rebuild this project's image from .aim/Dockerfile, then remove its container."""
     root = project_root()
     ensure_global()
     ensure_project(root)
@@ -1250,7 +1250,7 @@ def update_container(
     discard: bool = typer.Option(False, "--discard", "-y", help="Do not prompt before discarding container-local system changes."),
     no_cache: bool = typer.Option(False, "--no-cache", help="Disable Docker build cache for the whole image."),
 ) -> None:
-    """Refresh preinstalled tools by rebuilding the image and replacing the container."""
+    """Update preinstalled agent tools in this project's image, then remove its container."""
     if not docker_ok():
         console.print("[red]Docker is not available or the daemon is not running.[/]")
         raise typer.Exit(1)
@@ -1281,7 +1281,7 @@ def update_container(
 
 @app.command()
 def reset() -> None:
-    """Destroy and recreate the workspace, then enter it."""
+    """Remove this project's container, recreate it, then enter it; keep image/config."""
     root = project_root()
     remove_container(container_name(root))
     ensure_container(root)
@@ -1290,11 +1290,11 @@ def reset() -> None:
 
 @app.command()
 def clean(
-    image: bool = typer.Option(False, "--image", help="Also remove the current project's Docker image."),
-    all_: bool = typer.Option(False, "--all", help="Remove all aim-managed Docker containers and aim images."),
+    image: bool = typer.Option(False, "--image", help="Also remove this project's Docker image."),
+    all_: bool = typer.Option(False, "--all", help="Remove all aim-managed Docker containers/images; keep .aim/ and ~/.aim."),
     force: bool = typer.Option(False, "--force", "-f", help="Do not prompt when using --all."),
 ) -> None:
-    """Remove workspace Docker artifacts."""
+    """Remove Docker artifacts. Default: current project's container only."""
     if all_:
         if not force and not typer.confirm("Remove all aim containers and aim images?"):
             raise typer.Exit(1)
@@ -1311,7 +1311,7 @@ def clean(
 
 @app.command(name="list")
 def list_workspaces() -> None:
-    """List aim-managed containers."""
+    """List aim-managed Docker containers."""
     docker(["ps", "-a", "--filter", "label=aim.managed=1", "--format", "table {{.Names}}\t{{.Status}}\t{{.Image}}"])
 
 
@@ -1464,9 +1464,9 @@ def doctor() -> None:
     raise typer.Exit(0 if ok else 1)
 
 
-def print_shares(path: Path, cfg: dict[str, Any]) -> None:
+def print_shares(config_path: Path, cfg: dict[str, Any]) -> None:
     share = share_config(cfg)
-    console.print(f"config: [bold]{path}[/]")
+    console.print(f"config: [bold]{config_path}[/]")
 
     agents = share.get("agents", [])
     console.print("\n[bold]agents[/]")
@@ -1493,21 +1493,21 @@ def print_shares(path: Path, cfg: dict[str, Any]) -> None:
     console.print("\n[bold]readonly[/]")
     readonly = readonly_paths(cfg)
     if readonly:
-        for path in readonly:
-            console.print(f"  {path}")
+        for item in readonly:
+            console.print(f"  {item}")
     else:
         console.print("  none")
 
     console.print("\n[bold]readwrite[/]")
     readwrite = readwrite_paths(cfg)
     if readwrite:
-        for path in readwrite:
-            console.print(f"  {path}")
+        for item in readwrite:
+            console.print(f"  {item}")
     else:
         console.print("  none")
 
     console.print("\n[bold]hidden[/]")
-    hidden = hidden_paths(path.parent.parent, cfg) if path.name == "config.toml" else clean_project_paths(list(share.get("hidden", [])))
+    hidden = hidden_paths(config_path.parent.parent, cfg) if config_path.name == "config.toml" else clean_project_paths(list(share.get("hidden", [])))
     if hidden:
         for item in hidden:
             console.print(f"  {item}")

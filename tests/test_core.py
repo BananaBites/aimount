@@ -145,13 +145,20 @@ def test_share_dir_uses_unified_readonly_and_readwrite_lists(workspace: tuple[Pa
     home, project = workspace
     downloads = home / "Downloads"
     downloads.mkdir()
+    skills = home / ".skills"
+    skills.mkdir()
 
     cli.share_dir(str(downloads), ro=True)
     cli.share_dir(".aim", ro=True)
+    cli.share_dir(str(skills), ro=False)
 
     config = cli.load_toml(project / ".aim" / "config.toml")
     assert config["share"]["readonly"] == [str(downloads), ".aim"]
-    assert config["share"]["readwrite"] == []
+    assert config["share"]["readwrite"] == [str(skills)]
+
+    result = CliRunner().invoke(cli.app, ["share", "list"])
+    assert result.exit_code == 0
+    assert str(skills) in result.stdout
 
     cli.unshare_dir(str(downloads))
     config = cli.load_toml(project / ".aim" / "config.toml")

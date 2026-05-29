@@ -58,7 +58,7 @@ pipx install git+ssh://git@github.com/BananaBites/aimount.git
 Pinned to a tag/branch:
 
 ```bash
-pip install git+ssh://git@github.com/BananaBites/aimount.git@v0.5.1
+pip install git+ssh://git@github.com/BananaBites/aimount.git@v0.5.2
 ```
 
 Update to the latest version:
@@ -147,12 +147,14 @@ aim update --check        # check only; exits non-zero if an update exists
 aim status                # show project/config/container status
 aim run pi                # run a command inside the workspace
 aim run -- pi --help      # use -- before command flags
-aim rebuild
-aim update-container     # refresh image tools; warns about container-local system changes
-aim update-container -y  # skip the warning prompt
-aim reset
-aim clean
-aim clean --all           # remove all aim containers/images; prompts first
+aim rebuild              # rebuild this project's image from .aim/Dockerfile; may use Docker cache
+aim rebuild --no-cache   # rerun every Dockerfile layer, including tool installs
+aim update-container     # refresh preinstalled agent tools in image; remove container
+aim update-container -y  # skip prompt about discarding container-local system changes
+aim reset                # remove/recreate/enter this project's container; keep image/config
+aim clean                # remove this project's container only
+aim clean --image        # also remove this project's image
+aim clean --all           # remove all aim Docker containers/images; keep .aim/ and ~/.aim; prompts
 aim clean --all --force   # same, without prompt
 
 aim share agent pi        # ~/.aim/share/agents/pi -> ~/.pi
@@ -180,6 +182,16 @@ aim network bridge        # more isolation; use expose port for dev servers
 aim list
 aim doctor                # checks Docker, shares, and outside-project symlinks
 ```
+
+Notes:
+
+- `aim update` updates the host `aim` CLI.
+- `aim update-container` updates the agent tools installed inside the project Docker image.
+- `aim rebuild` is for Dockerfile/config changes; it may still reuse Docker cache.
+- `aim rebuild --no-cache` reruns every Dockerfile layer, including tool installs,
+  but is slower than `aim update-container`.
+- `aim clean --all` removes Docker artifacts only. It does not delete project `.aim/`
+  folders or `~/.aim` shared storage.
 
 
 ## Recommended Pi workflow
